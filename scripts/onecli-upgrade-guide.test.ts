@@ -820,6 +820,10 @@ esac
     },
   );
 
+  it('trusts a 127.0.0.1 binding when $GW names localhost', () => {
+    expect(dial({ rules: [], gw: 'http://localhost:10254' }).status).toBe(0);
+  });
+
   it('trusts a container that publishes the port on every address', () => {
     expect(dial({ rules: [], ports: { '10254/tcp': [{ HostIp: '0.0.0.0', HostPort: '10254' }] } }).status).toBe(0);
   });

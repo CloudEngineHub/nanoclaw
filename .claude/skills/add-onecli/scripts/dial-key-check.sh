@@ -63,7 +63,7 @@ hp=${GW#*://}; hp=${hp%%/*}; gh=${hp%:*}; gp=${hp##*:}
 case "$gh" in 127.0.0.1 | localhost | 172.17.0.1) ;; *) gp= ;; esac
 if [ "$S" = policy ] && [ -n "$gp" ] && [ "$gp" != "$hp" ] \
   && docker inspect -f '{{json .NetworkSettings.Ports}}' "$C" 2>/dev/null \
-    | jq -e --arg p "$gp" --arg h "$gh" '[(. // {})[] | (. // [])[] | select(.HostPort == $p and ((.HostIp // "") as $i | any(["", "0.0.0.0", "::", $h][]; . == $i)))] | length > 0' >/dev/null 2>&1 \
+    | jq -e --arg p "$gp" --arg h "$gh" '[(. // {})[] | (. // [])[] | select(.HostPort == $p and ((.HostIp // "") as $i | any(["", "0.0.0.0", "::", $h] + (if $h == "localhost" then ["127.0.0.1", "::1"] else [] end) | .[]; . == $i)))] | length > 0' >/dev/null 2>&1 \
   && E=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$C" 2>/dev/null); then
   case "$(printf '%s\n' "$E" | grep '^POLICY_ENFORCE_V2=' | tail -1)" in
     "" | POLICY_ENFORCE_V2=1 | POLICY_ENFORCE_V2=true) mode=policy ;;
