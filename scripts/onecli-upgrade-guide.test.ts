@@ -463,16 +463,20 @@ describe('OneCLI upgrade guide: Dial installs', () => {
     hint: 'h',
     data: [
       { id: 'd1', name: 'Dial API', hostPattern: 'api.getdial.ai' },
-      { id: 'x1', name: 'Other key', hostPattern: 'api.getdial.ai' },
+      { id: 'x1', name: 'Phone key', hostPattern: 'api.getdial.ai' },
       { id: 'm1', name: 'Anthropic', hostPattern: 'api.anthropic.com' },
     ],
   };
+  const health = (version: string) => JSON.stringify({ status: 'ok', version });
 
+  // `curl` answers the health reads in turn (the last one repeats), so a test can
+  // move the gateway between the check and a delete.
   function dial(
     opts: {
       version?: string;
-      health?: string;
+      healths?: string[];
       healthExit?: number;
+      modes?: string[];
       secrets?: unknown;
       secretsRaw?: string;
       listExit?: number;
@@ -480,20 +484,30 @@ describe('OneCLI upgrade guide: Dial installs', () => {
       rulesExit?: number;
       deleteExit?: number;
       gw?: string | null;
+      env?: Record<string, string>;
     } = {},
     args: string[] = [],
   ) {
     const bin = path.join(home, 'bin');
     fs.mkdirSync(bin, { recursive: true });
-    fs.writeFileSync(
-      path.join(home, 'health.json'),
-      opts.health ?? JSON.stringify({ status: 'ok', version: opts.version ?? '1.42.0' }),
-    );
+    const healths = opts.healths ?? [health(opts.version ?? '1.42.0')];
+    healths.forEach((h, i) => fs.writeFileSync(path.join(home, `health${i}.json`), h));
     fs.writeFileSync(path.join(home, 'secrets.json'), opts.secretsRaw ?? JSON.stringify(opts.secrets ?? SECRETS));
     fs.writeFileSync(path.join(home, 'rules.json'), JSON.stringify(opts.rules ?? [DIAL_RULE]));
+    const agents = (opts.modes ?? ['selective']).map((secretMode, i) => ({
+      id: `oc-${i}`,
+      identifier: `ag-${i}`,
+      secretMode,
+    }));
+    fs.writeFileSync(path.join(home, 'agents.json'), JSON.stringify({ data: agents }));
     fs.writeFileSync(
       path.join(bin, 'curl'),
-      `#!/bin/sh\necho "curl $*" >> "${home}/calls.log"\n[ ${opts.healthExit ?? 0} = 0 ] || exit ${opts.healthExit ?? 0}\ncat "${home}/health.json"\n`,
+      `#!/bin/sh
+echo "curl $*" >> "${home}/calls.log"
+[ ${opts.healthExit ?? 0} = 0 ] || exit ${opts.healthExit ?? 0}
+n=$(grep -c '^curl ' "${home}/calls.log"); i=$((n - 1)); [ "$i" -lt ${healths.length} ] || i=${healths.length - 1}
+cat "${home}/health$i.json"
+`,
       { mode: 0o755 },
     );
     fs.writeFileSync(
@@ -503,6 +517,7 @@ echo "$ONECLI_API_HOST $*" >> "${home}/calls.log"
 case "$1 $2" in
   "secrets list") [ "$3 $4" = "--max 0" ] || exit 7; [ ${opts.listExit ?? 0} = 0 ] || exit ${opts.listExit ?? 0}; cat "${home}/secrets.json" ;;
   "secrets delete") exit ${opts.deleteExit ?? 0} ;;
+  "agents list") [ "$3 $4" = "--max 0" ] || exit 7; cat "${home}/agents.json" ;;
   "policy rules") [ ${opts.rulesExit ?? 0} = 0 ] || exit ${opts.rulesExit ?? 0}; cat "${home}/rules.json" ;;
   "policy default") echo '{"isDefault":true,"action":"allow"}' ;;
   *) exit 9 ;;
@@ -512,7 +527,12 @@ esac
     );
     const gw = opts.gw === undefined ? GW : opts.gw;
     return spawnSync('sh', [SCRIPT, ...args], {
-      env: { PATH: `${bin}:${process.env.PATH ?? ''}`, HOME: home, ...(gw === null ? {} : { GW: gw }) },
+      env: {
+        PATH: `${bin}:${process.env.PATH ?? ''}`,
+        HOME: home,
+        ...(gw === null ? {} : { GW: gw }),
+        ...(opts.env ?? {}),
+      },
       encoding: 'utf8',
     });
   }
@@ -534,8 +554,10 @@ esac
     expect(del).toBeLessThan(guide.indexOf(saveLine(UPGRADE)));
     expect(del).toBeLessThan(guide.indexOf('docker compose pull onecli'));
     const before = guide.slice(0, guide.lastIndexOf('```bash', del)).trimEnd();
-    expect(before.slice(before.lastIndexOf('\n\n'))).toMatch(/If it prints `delete`/);
-    expect(before.slice(before.lastIndexOf('\n\n'))).toMatch(/If it prints `keep`, do not delete the Dial key/);
+    const paragraph = before.slice(before.lastIndexOf('\n\n'));
+    expect(paragraph).toMatch(/If it prints `delete`/);
+    expect(paragraph).toMatch(/If it prints `keep`, do not delete the Dial key/);
+    expect(guide.slice(0, at)).toMatch(/runs once per project \(`ONECLI_PROJECT=<project id>` in front\)/);
     expect(guide.slice(del)).toMatch(/re-run `\/add-dial-tool` after the upgrade/);
     // No Dial delete outside the check, and no unconditional advice left.
     expect(guide.slice(0, guide.indexOf('## 3. Verify'))).not.toMatch(/secrets delete/);
@@ -543,18 +565,18 @@ esac
     expect(guide).not.toMatch(/upgraded with the key in place, delete it now/);
   });
 
-  it('a gateway that has not converted, with a Dial key and a rule the conversion deletes: deletes only Dial keys on api.getdial.ai', () => {
+  it('a gateway that has not converted, with a Dial key and a rule the conversion deletes: deletes every key for the Dial host', () => {
     const r = dial({}, ['--delete']);
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('delete: the gateway at http://gw-being-upgraded:10254 (1.42.0) has not converted yet');
     expect(r.stdout).toContain('rule: block  Dial: blocked agents');
-    expect(deletes()).toEqual([`${GW} secrets delete --id d1`]);
+    expect(deletes()).toEqual([`${GW} secrets delete --id d1`, `${GW} secrets delete --id x1`]);
   });
 
-  it('without --delete it only reports: delete and the ids, exit 1, nothing deleted', () => {
+  it('without --delete it only reports: delete and the keys, exit 1, nothing deleted', () => {
     const r = dial();
     expect(r.status).toBe(1);
-    expect(r.stdout).toMatch(/^delete: .*\nd1\n$/m);
+    expect(r.stdout).toMatch(/^delete: .*\nd1 "Dial API"\nx1 "Phone key"\n$/m);
     expect(deletes()).toEqual([]);
   });
 
@@ -562,9 +584,9 @@ esac
     [
       'a gateway already on 1.45, which converted',
       { version: '1.45.0' },
-      /keep: .* runs 1\.45\.0, so it has already converted/,
+      /keep: .* runs 1\.45\.0 and the project .* has converted/,
     ],
-    ['a gateway on 1.44, which converted', { version: '1.44.2' }, /already converted/],
+    ['a gateway on 1.44, which converted', { version: '1.44.2' }, /has converted/],
     ['a gateway with no Dial key', { secrets: { data: [SECRETS.data[2]] } }, /keep: there is no Dial key/],
     ['a policy the conversion keeps (Dial scoped to all)', { rules: [] }, /keep: the conversion deletes nothing/],
   ])('keeps the Dial key on %s, even with --delete', (_name, opts, said) => {
@@ -575,56 +597,79 @@ esac
     expect(dial(opts).status).toBe(0);
   });
 
-  it('on a converted gateway it reads only the version: no secret or policy call', () => {
+  it('on a converted gateway it reads only the version and the agent modes', () => {
     expect(dial({ version: '1.45.0' }, ['--delete']).status).toBe(0);
-    expect(calls()).toEqual([`curl -fsS --max-time 10 ${GW}/api/health`]);
+    expect(calls()).toEqual([`curl -fsS --max-time 10 ${GW}/api/health`, `${GW} agents list --max 0`]);
   });
 
-  it('asks only the gateway being upgraded ($GW)', () => {
-    expect(dial({}, ['--delete']).status).toBe(0);
+  it('asks only the gateway being upgraded ($GW), in the project ONECLI_PROJECT names', () => {
+    const r = dial({ env: { ONECLI_PROJECT: 'proj-b' } }, ['--delete']);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain('Dial keys in the project proj-b');
     const onecli = calls().filter((l) => !l.startsWith('curl '));
     expect(onecli.length).toBeGreaterThan(0);
     expect(onecli.every((l) => l.startsWith(`${GW} `))).toBe(true);
-    expect(calls()[0]).toBe(`curl -fsS --max-time 10 ${GW}/api/health`);
+    expect(
+      calls()
+        .filter((l) => l.startsWith('curl '))
+        .every((l) => l.endsWith(` ${GW}/api/health`)),
+    ).toBe(true);
   });
 
   it.each([
     ['GW is unset', { gw: null }],
     ['the gateway does not answer', { healthExit: 7 }],
-    ['the health answer is not JSON', { health: 'Bad Gateway' }],
-    ['the version is not one it knows', { version: 'v1.45.0' }],
+    ['the health answer is not JSON', { healths: ['Bad Gateway'] }],
+    ['the health answer has no version', { healths: ['{}'] }],
+    ['the version is unknown', { version: 'unknown' }],
+    ['the version is not a plain release', { version: '1.44.garbage' }],
+    ['the version is a pre-release', { version: '1.45.0-rc.1' }],
+    ['the version spans lines', { version: '1.42.0\n1.45.0' }],
+    ['a converted gateway still has agents in all mode', { version: '1.45.0', modes: ['selective', 'all'] }],
     ['the secret list fails', { listExit: 1 }],
     ['the secret list is only whitespace', { secretsRaw: ' \t\n' }],
     ['the secret list is not a list', { secretsRaw: '{"data":null}' }],
     ['the policy cannot be read', { rulesExit: 1 }],
   ])('stops and deletes nothing when %s', (_name, opts) => {
     const r = dial(opts, ['--delete']);
-    expect(r.status).not.toBe(0);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('STOP');
     expect(r.stdout).not.toMatch(/^(keep|delete):/m);
     expect(deletes()).toEqual([]);
   });
 
   it('stops on a failed delete', () => {
     const r = dial({ deleteExit: 1 }, ['--delete']);
-    expect(r.status).not.toBe(0);
+    expect(r.status).toBe(2);
     expect(r.stderr).toContain('could not delete the Dial key d1');
-    expect(r.stdout).not.toContain('Dial keys deleted');
+    expect(deletes()).toHaveLength(1);
   });
 
-  it('matches by host and name only, whatever else a secret name holds', () => {
+  it('re-reads the version before each delete and keeps the rest once the gateway has converted', () => {
+    const r = dial({ healths: [health('1.42.0'), health('1.42.0'), health('1.45.0')] }, ['--delete']);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('now runs 1.45.0, so it has converted; the Dial key x1 was kept');
+    expect(deletes()).toEqual([`${GW} secrets delete --id d1`]);
+  });
+
+  it('matches every key for the Dial host whatever its name, and prints names escaped', () => {
     const secrets = {
       data: [
         { id: 'd1', name: 'Dial API', hostPattern: 'api.getdial.ai' },
-        { id: 'd2', name: 'old DIAL key; $(touch pwned) `id` *', hostPattern: 'api.getdial.ai' },
+        { id: 'd2', name: 'old key; $(touch pwned) `id` *\n\u001b[2Jfake: keep', hostPattern: 'api.getdial.ai' },
         { id: 'n1', name: null, hostPattern: 'api.getdial.ai' },
-        { id: 'n2', name: 42, hostPattern: 'api.getdial.ai' },
+        { id: 'u1', name: 42, hostPattern: 'API.GETDIAL.AI' },
+        { id: 'w1', name: 'wildcard', hostPattern: '*.getdial.ai' },
         { id: 'h1', name: 'Dial API', hostPattern: 'api.getdial.ai.evil.test' },
-        { id: 'h2', name: 'Dial API', hostPattern: '*.example.com' },
+        { id: 'h2', name: 'Dial API', hostPattern: 'notgetdial.ai' },
+        { id: 'h3', name: 'Dial API', hostPattern: null },
       ],
     };
     const r = dial({ secrets }, ['--delete']);
     expect(r.status).toBe(0);
-    expect(deletes()).toEqual([`${GW} secrets delete --id d1`, `${GW} secrets delete --id d2`]);
+    expect(deletes()).toEqual(['d1', 'd2', 'n1', 'u1', 'w1'].map((id) => `${GW} secrets delete --id ${id}`));
+    expect(r.stdout).toContain('d2 "old key; $(touch pwned) `id` *\\n\\u001b[2Jfake: keep"');
+    expect(r.stdout).not.toContain('\u001b');
   });
 
   it.each(['*', 'd1 d2', '../x', ''])('refuses a Dial key id it cannot pass safely (%j)', (id) => {
@@ -634,8 +679,7 @@ esac
         { id, name: 'Dial 2', hostPattern: 'api.getdial.ai' },
       ],
     };
-    const r = dial({ secrets }, ['--delete']);
-    expect(r.status).not.toBe(0);
+    expect(dial({ secrets }, ['--delete']).status).toBe(2);
     expect(deletes()).toEqual([]);
   });
 
@@ -661,7 +705,7 @@ esac
   it.each(['sh', 'bash', 'zsh'].filter((sh) => spawnSync(sh, ['-c', 'true']).status === 0))(
     'the guide command hands the Detect step’s unexported GW to the script and deletes each Dial key under %s',
     (shell) => {
-      dial({ secrets: { data: [SECRETS.data[0], { id: 'd2', name: 'Old Dial', hostPattern: 'api.getdial.ai' }] } });
+      dial();
       fs.rmSync(path.join(home, 'calls.log'), { force: true });
       const cmd = `${CHECK} --delete`.replace('sh .claude', `sh ${path.resolve(__dirname, '..')}/.claude`);
       const r = spawnSync(shell, ['-c', `GW=http://from-detect.test:1; ${cmd}`], {
@@ -671,17 +715,19 @@ esac
       expect(r.status).toBe(0);
       expect(deletes()).toEqual([
         'http://from-detect.test:1 secrets delete --id d1',
-        'http://from-detect.test:1 secrets delete --id d2',
+        'http://from-detect.test:1 secrets delete --id x1',
       ]);
     },
   );
 
-  it('an install that already converted with the Dial rule in place re-runs /add-dial-tool, not a delete', () => {
+  it('an install that already converted with the Dial rule in place re-runs /add-dial-tool and detaches the rest, not a delete', () => {
     const after = guide.slice(
       guide.indexOf('If the gateway already converted while `Dial: blocked agents` was in place'),
     );
     const paragraph = after.slice(0, after.indexOf('\n\n'));
     expect(paragraph).toMatch(/Re-run `\/add-dial-tool` now, on every install that shares the gateway/);
+    expect(paragraph).toMatch(/OneCLI's default agent included/);
+    expect(paragraph).toContain('onecli agents grants detach-secret --id <agent-id> --secret-id <dial-secret-id>');
     expect(paragraph).not.toMatch(/delete/i);
   });
 });
