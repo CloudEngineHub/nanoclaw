@@ -77,16 +77,27 @@ The agent needs a Vercel personal access token. Tell the user:
 >
 > After creating the token, copy it — you'll only see it once.
 
-Once the user provides the token, add it to OneCLI:
+Once the user provides the token, add it to OneCLI from a file in a private temporary directory. Never put the token in a shell command: any local user can read a running command's text with `ps`. Make the directory:
 
 ```bash
+mktemp -d "${TMPDIR:-/tmp}/nanoclaw-vercel-token.XXXXXX"
+```
+
+Write the token, and nothing else, to `token` in the printed directory with your file-writing tool, not a shell command. Then put the directory in `D` and run the block right away. If you are not going to run it (the user stops, or the token was wrong), delete the directory with `rm -rf` first. OneCLI's own output is dropped, since a gateway error can quote the token. The block also clears a directory of yours that an earlier run left more than 10 minutes ago, when it stopped before this step:
+
+```bash
+(
+D="<directory printed by mktemp -d>"
+trap 'rm -rf "$D"; find -H "${TMPDIR:-/tmp}" -maxdepth 1 -name "nanoclaw-vercel-token.*" -user "$(id -u)" -mmin +10 -exec rm -rf {} + 2>/dev/null' EXIT
 onecli secrets create \
   --name "Vercel API Token" \
   --type generic \
-  --value "<TOKEN>" \
+  --file "$D/token" \
   --host-pattern "api.vercel.com" \
   --header-name "Authorization" \
-  --value-format "Bearer {value}"
+  --value-format "Bearer {value}" >/dev/null 2>&1 \
+  || { echo "OneCLI did not save the token: check that onecli secrets list works, then ask for the token again" >&2; exit 1; }
+)
 ```
 
 Verify:

@@ -18,6 +18,12 @@ import { run } from './auth.js';
 let root: string;
 const record = () =>
   JSON.parse(fs.readFileSync(path.join(root, 'data', 'onecli', 'provider-credentials.json'), 'utf8')).providers;
+// The sign-in script writes the captured token to the path it is given.
+const signIn = () =>
+  child.spawn.mockImplementationOnce((_cmd: string, args: string[]) => {
+    fs.writeFileSync(args[1], 'sk-ant-oat01-fixture');
+    return { status: 0 };
+  });
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'onecli-auth-'));
   vi.spyOn(process, 'cwd').mockReturnValue(root);
@@ -42,6 +48,7 @@ it('records the Anthropic secret a subscription sign-in saved', async () => {
   child.exec
     .mockReturnValueOnce(JSON.stringify({ data: [{ id: 'sec-vercel', name: 'Vercel', type: 'generic' }] }))
     .mockReturnValueOnce(JSON.stringify({ data: [{ id: 'sec-vercel', name: 'Vercel', type: 'generic' }] }))
+    .mockReturnValueOnce('') // secrets create, no id in its output
     .mockReturnValueOnce(
       JSON.stringify({
         data: [
@@ -51,9 +58,11 @@ it('records the Anthropic secret a subscription sign-in saved', async () => {
       }),
     );
   prompts.select.mockResolvedValueOnce('subscription');
-  child.spawn.mockReturnValueOnce({ status: 0 });
+  signIn();
   await run();
-  expect(child.exec.mock.calls.every(([, args]) => args.includes('--max') && args.includes('0'))).toBe(true);
+  const calls = child.exec.mock.calls.map(([, args]) => args as string[]);
+  expect(calls.filter((a) => a[1] === 'list').every((a) => a.includes('--max') && a.includes('0'))).toBe(true);
+  expect(calls.find((a) => a[1] === 'create')).toEqual(expect.arrayContaining(['--type', 'anthropic', '--file']));
   expect(record()).toEqual({ claude: ['sec-sub'] });
 });
 
@@ -85,9 +94,10 @@ it('with duplicate Anthropic secrets and none recorded, asks to sign in and reco
   child.exec
     .mockReturnValueOnce(JSON.stringify({ data: dupes }))
     .mockReturnValueOnce(JSON.stringify({ data: dupes }))
+    .mockReturnValueOnce('')
     .mockReturnValueOnce(JSON.stringify({ data: [...dupes, { id: 'sec-new', name: 'Anthropic', type: 'anthropic' }] }));
   prompts.select.mockResolvedValueOnce('subscription');
-  child.spawn.mockReturnValueOnce({ status: 0 });
+  signIn();
   await run();
   expect(prompts.select).toHaveBeenCalledOnce();
   expect(record()).toEqual({ claude: ['sec-new'] });
@@ -140,6 +150,7 @@ it('a subscription sign-in that sees two new Anthropic secrets records neither a
   child.exec
     .mockReturnValueOnce(JSON.stringify({ data: [] }))
     .mockReturnValueOnce(JSON.stringify({ data: [] }))
+    .mockReturnValueOnce('')
     .mockReturnValueOnce(
       JSON.stringify({
         data: [
@@ -149,27 +160,40 @@ it('a subscription sign-in that sees two new Anthropic secrets records neither a
       }),
     );
   prompts.select.mockResolvedValueOnce('subscription');
-  child.spawn.mockReturnValueOnce({ status: 0 });
+  signIn();
   await expect(run()).rejects.toThrow(/more than one/);
   expect(fs.existsSync(path.join(root, 'data', 'onecli', 'provider-credentials.json'))).toBe(false);
 });
 
-it('saves a subscription token only under the name setup records', () => {
+it('saves a subscription token only under the name setup records', async () => {
   // A custom name would be saved but never recorded, so the group gets no key.
   const script = fs.readFileSync(path.join(__dirname, 'register-claude-token.sh'), 'utf8');
-  expect(script).not.toMatch(/SECRET_NAME/);
-  expect(script).toMatch(/--name Anthropic\b/);
+  expect(script).not.toMatch(/SECRET_NAME|onecli secrets/);
+  child.exec.mockImplementation((_cmd: string, args: string[]) =>
+    args[1] === 'list' ? '{"data":[]}' : '{"id":"sec-sub","name":"Anthropic"}',
+  );
+  prompts.select.mockResolvedValueOnce('subscription');
+  signIn();
+  await run();
+  const create = child.exec.mock.calls.find(([, args]) => args[1] === 'create')?.[1];
+  expect(create).toEqual(expect.arrayContaining(['--name', 'Anthropic']));
+  expect(record()).toEqual({ claude: ['sec-sub'] });
 });
 
 describe('pasted Claude keys', () => {
   const argv = process.argv;
+  // What `secrets create` read from its --file; the key itself never goes on argv.
+  let saved: string | undefined;
   beforeEach(() => {
     // No .env and no saved secret, so run() goes straight to the prompt.
     process.argv = [argv[0], argv[1], 'claude'];
     vi.stubEnv('NANOCLAW_ANTHROPIC_BASE_URL', '');
-    child.exec.mockImplementation((_cmd: string, args: string[]) =>
-      args[1] === 'list' ? '{"data":[]}' : '{"id":"sec-new","name":"Anthropic"}',
-    );
+    saved = undefined;
+    child.exec.mockImplementation((_cmd: string, args: string[]) => {
+      if (args[1] === 'list') return '{"data":[]}';
+      saved = fs.readFileSync(args[args.indexOf('--file') + 1], 'utf8');
+      return '{"id":"sec-new","name":"Anthropic"}';
+    });
   });
   afterEach(() => {
     process.argv = argv;
@@ -181,9 +205,11 @@ describe('pasted Claude keys', () => {
     await run();
     expect(child.exec).toHaveBeenCalledWith(
       'onecli',
-      expect.arrayContaining(['create', '--type', 'anthropic', '--value', 'sk-ant-svc01-fixture']),
+      expect.arrayContaining(['create', '--type', 'anthropic', '--file']),
       expect.anything(),
     );
+    expect(saved).toBe('sk-ant-svc01-fixture');
+    expect(child.exec.mock.calls.flatMap(([, args]) => args)).not.toContain('sk-ant-svc01-fixture');
     expect(record()).toEqual({ claude: ['sec-new'] });
     const { message, validate } = prompts.password.mock.calls[0][0];
     expect(message).toMatch(/one workspace/);
@@ -205,13 +231,14 @@ describe('pasted Claude keys', () => {
         'Anthropic',
         '--type',
         'anthropic',
-        '--value',
-        'sk-ant-oat01-fixture',
         '--host-pattern',
         'api.anthropic.com',
+        '--file',
+        expect.any(String),
       ],
       expect.anything(),
     );
+    expect(saved).toBe('sk-ant-oat01-fixture');
     expect(prompts.password.mock.calls[0][0].validate?.('sk-ant-oat01-x')).toBeUndefined();
   });
 
