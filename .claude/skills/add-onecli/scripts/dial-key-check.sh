@@ -11,28 +11,32 @@ case "${1:-}" in "" | --delete) ;; *) echo "usage: dial-key-check.sh [--delete]"
 stop() { echo "STOP: $1; do not upgrade" >&2; exit 2; }
 [ -n "${GW:-}" ] || stop "set GW to the gateway address, as in the Detect step"
 export ONECLI_API_HOST="$GW"
-P="project ${ONECLI_PROJECT:-set in the onecli CLI}"
+PJ=${ONECLI_PROJECT:-$(onecli config get project 2>/dev/null | jq -r '.value // empty' 2>/dev/null)}
+P="project ${PJ:-of the OneCLI API key}"
 LIST='if type == "array" then . elif (type == "object") and ((.data | type) == "array") then .data else error("not a list") end'
-# Only a plain release decides anything; sets V, and C=1 once the gateway is 1.44 or later.
+# Only one plain release decides anything; sets V, and C=1 once the gateway is 1.44 or later.
 read_version() {
   H=$(curl -fsS --max-time 10 "$GW/api/health") || stop "could not reach the gateway at $GW"
-  V=$(printf '%s' "$H" | jq -er 'if (type == "object") and ((.version | type) == "string") and (.version | test("\\A[0-9]{1,4}\\.[0-9]{1,4}\\.[0-9]{1,6}\\z")) then .version else error("no version") end' 2>/dev/null) \
-    || stop "the gateway at $GW does not report a release version, so it is unclear whether it has converted"
+  V=$(printf '%s' "$H" | jq -ers 'if (length == 1) and (.[0] | type == "object") and (.[0].version | type == "string") and (.[0].version | test("\\A[0-9]{1,4}\\.[0-9]{1,4}\\.[0-9]{1,6}\\z")) then .[0].version else error("no version") end' 2>/dev/null) \
+    || stop "the gateway at $GW does not report one release version, so it is unclear whether it has converted"
   M=${V%%.*}; m=${V#*.}; m=${m%%.*}
   if [ "$M" -gt 1 ] || { [ "$M" -eq 1 ] && [ "$m" -ge 44 ]; }; then C=1; else C=0; fi
 }
 read_version
 if [ "$C" = 1 ]; then
-  # A conversion that failed is retried on the next start, with every key, so it must be finished.
+  # OneCLI retries the conversion on every start while an agent is not selective.
+  # Rules a failed conversion left are not readable on 1.44+; the post-upgrade check covers those.
   A=$(onecli agents list --max 0) || stop "could not list the OneCLI agents at $GW"
-  N=$(printf '%s' "$A" | jq -er "[($LIST)[] | select(.secretMode == \"all\")] | length") || stop "could not read the OneCLI agent list at $GW"
-  [ "$N" = 0 ] || stop "the gateway at $GW runs $V, but $N agent(s) in the $P are still in all mode: its conversion has not finished, and the next start can give them every key, Dial included. Run the post-upgrade check"
-  echo "keep: the gateway at $GW runs $V and the $P has converted, so grants decide which agents hold the Dial key"
+  N=$(printf '%s' "$A" | jq -er "[($LIST)[] | select((type != \"object\") or (.secretMode != \"selective\"))] | length") \
+    || stop "could not read the OneCLI agent list at $GW"
+  [ "$N" = 0 ] || stop "the gateway at $GW runs $V, but $N agent(s) in the $P are not in selective mode: its conversion has not finished, and the next start can give them every key, Dial included. Run the post-upgrade check"
+  echo "keep: the gateway at $GW runs $V and every agent in the $P has converted, so grants decide which agents hold the Dial key"
   exit 0
 fi
-# Any key for the Dial host, whatever its name: the conversion would hand each one out.
+# A Dial key is any secret OneCLI injects on api.getdial.ai, whatever its name; this
+# is the gateway's host matcher (split at the first `*`, case-insensitive).
+DIAL="def hm(\$h): ascii_downcase as \$p | (\$h | ascii_downcase) as \$x | (\$p | index(\"*\")) as \$i | if \$i == null then \$p == \$x else \$p[:\$i] as \$a | \$p[\$i + 1:] as \$b | (\$x | length) >= (\$a | length) + (\$b | length) and (\$x | startswith(\$a)) and (\$x | endswith(\$b)) end; ($LIST)[] | select((type == \"object\") and ((.hostPattern | type) == \"string\") and (.hostPattern | hm(\"api.getdial.ai\")))"
 L=$(onecli secrets list --max 0) && [ -n "$(printf '%s' "$L" | tr -d '[:space:]')" ] || stop "could not read the OneCLI secrets"
-DIAL="($LIST)[] | select((.hostPattern | type) == \"string\" and (.hostPattern | ascii_downcase | test(\"(\\\\A|\\\\.)getdial\\\\.ai\\\\.?(:[0-9]+)?\\\\z\")))"
 ids=$(printf '%s' "$L" | jq -r "$DIAL | .id | if (type == \"string\") and test(\"\\\\A[A-Za-z0-9_-]{1,128}\\\\z\") then . else error(\"bad secret id\") end") \
   || stop "could not read the OneCLI secrets"
 [ -n "$ids" ] || { echo "keep: there is no Dial key at $GW in the $P"; exit 0; }
@@ -44,13 +48,17 @@ case $? in
   1) ;;
   *) stop "could not read the policy at $GW" ;;
 esac
+other=$(printf '%s' "$L" | jq -r "$DIAL | select(.hostPattern | ascii_downcase | contains(\"getdial\") | not) | \"\\(.id) \\(.hostPattern | tojson)\"") || stop "could not read the OneCLI secrets"
+[ -z "$other" ] || stop "these secrets reach api.getdial.ai through a wider host pattern, so they are not only Dial keys; decide about them by hand: $other"
 echo "delete: the gateway at $GW ($V) has not converted yet, and the conversion removes what is listed above, which may be what keeps agents away from Dial. Dial keys in the $P (id, name):"
 printf '%s' "$L" | jq -r "$DIAL | \"\\(.id) \\(.name | tojson)\""
 [ "${1:-}" = --delete ] || exit 1
+# A gateway that converts between the last read and a delete had this Dial rule
+# in place, so the delete is still the one the conversion called for.
 for id in $ids; do
-  # The gateway may have moved since the check: never delete on a converted one.
   read_version
   [ "$C" = 0 ] || stop "the gateway at $GW now runs $V, so it has converted; the Dial key $id was kept"
-  onecli secrets delete --id "$id" >/dev/null || stop "could not delete the Dial key $id"
+  onecli secrets delete --id "$id" >/dev/null \
+    || stop "could not delete the Dial key $id. \`onecli secrets delete\` acts only in the API key's own project, so in another project delete it in the OneCLI console"
   echo "deleted Dial key $id"
 done

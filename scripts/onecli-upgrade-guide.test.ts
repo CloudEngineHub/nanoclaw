@@ -477,6 +477,8 @@ describe('OneCLI upgrade guide: Dial installs', () => {
       healths?: string[];
       healthExit?: number;
       modes?: string[];
+      agentsRaw?: string;
+      cliProject?: string;
       secrets?: unknown;
       secretsRaw?: string;
       listExit?: number;
@@ -499,7 +501,7 @@ describe('OneCLI upgrade guide: Dial installs', () => {
       identifier: `ag-${i}`,
       secretMode,
     }));
-    fs.writeFileSync(path.join(home, 'agents.json'), JSON.stringify({ data: agents }));
+    fs.writeFileSync(path.join(home, 'agents.json'), opts.agentsRaw ?? JSON.stringify({ data: agents }));
     fs.writeFileSync(
       path.join(bin, 'curl'),
       `#!/bin/sh
@@ -520,6 +522,7 @@ case "$1 $2" in
   "agents list") [ "$3 $4" = "--max 0" ] || exit 7; cat "${home}/agents.json" ;;
   "policy rules") [ ${opts.rulesExit ?? 0} = 0 ] || exit ${opts.rulesExit ?? 0}; cat "${home}/rules.json" ;;
   "policy default") echo '{"isDefault":true,"action":"allow"}' ;;
+  "config get") [ "$3" = project ] || exit 7; echo '{"key":"project","value":"${opts.cliProject ?? ''}"}' ;;
   *) exit 9 ;;
 esac
 `,
@@ -584,11 +587,16 @@ esac
     [
       'a gateway already on 1.45, which converted',
       { version: '1.45.0' },
-      /keep: .* runs 1\.45\.0 and the project .* has converted/,
+      /keep: .* runs 1\.45\.0 and every agent in the project of the OneCLI API key has converted/,
     ],
     ['a gateway on 1.44, which converted', { version: '1.44.2' }, /has converted/],
     ['a gateway with no Dial key', { secrets: { data: [SECRETS.data[2]] } }, /keep: there is no Dial key/],
     ['a policy the conversion keeps (Dial scoped to all)', { rules: [] }, /keep: the conversion deletes nothing/],
+    [
+      'a policy the conversion keeps, even with a catch-all secret',
+      { rules: [], secrets: { data: [{ id: 'c1', name: 'All hosts', hostPattern: '*' }] } },
+      /keep: the conversion deletes nothing/,
+    ],
   ])('keeps the Dial key on %s, even with --delete', (_name, opts, said) => {
     const r = dial(opts, ['--delete']);
     expect(r.status).toBe(0);
@@ -599,7 +607,15 @@ esac
 
   it('on a converted gateway it reads only the version and the agent modes', () => {
     expect(dial({ version: '1.45.0' }, ['--delete']).status).toBe(0);
-    expect(calls()).toEqual([`curl -fsS --max-time 10 ${GW}/api/health`, `${GW} agents list --max 0`]);
+    expect(calls()).toEqual([
+      `${GW} config get project`,
+      `curl -fsS --max-time 10 ${GW}/api/health`,
+      `${GW} agents list --max 0`,
+    ]);
+  });
+
+  it("names the onecli CLI's own project when ONECLI_PROJECT is unset", () => {
+    expect(dial({ cliProject: 'proj-c' }).stdout).toContain('Dial keys in the project proj-c');
   });
 
   it('asks only the gateway being upgraded ($GW), in the project ONECLI_PROJECT names', () => {
@@ -625,7 +641,23 @@ esac
     ['the version is not a plain release', { version: '1.44.garbage' }],
     ['the version is a pre-release', { version: '1.45.0-rc.1' }],
     ['the version spans lines', { version: '1.42.0\n1.45.0' }],
+    ['the health answer holds two records', { healths: [`${health('1.42.0')}\n${health('1.45.0')}`] }],
     ['a converted gateway still has agents in all mode', { version: '1.45.0', modes: ['selective', 'all'] }],
+    ['a converted gateway lists an agent in another mode', { version: '1.45.0', modes: ['selective', 'legacy'] }],
+    [
+      'a converted gateway lists an agent with no mode',
+      { version: '1.45.0', agentsRaw: '{"data":[{"id":"oc-0","secretMode":"selective"},{"id":"oc-1"}]}' },
+    ],
+    ['a converted gateway lists a null agent', { version: '1.45.0', agentsRaw: '{"data":[null]}' }],
+    ['the agent list is empty output', { version: '1.45.0', agentsRaw: '' }],
+    [
+      'a secret reaches the Dial host through a wider pattern',
+      { secrets: { data: [SECRETS.data[0], { id: 'w9', name: 'Dial API', hostPattern: 'api.*dial.ai' }] } },
+    ],
+    [
+      'a catch-all secret would be widened',
+      { secrets: { data: [SECRETS.data[0], { id: 'c1', name: 'All', hostPattern: '*' }] } },
+    ],
     ['the secret list fails', { listExit: 1 }],
     ['the secret list is only whitespace', { secretsRaw: ' \t\n' }],
     ['the secret list is not a list', { secretsRaw: '{"data":null}' }],
@@ -642,6 +674,7 @@ esac
     const r = dial({ deleteExit: 1 }, ['--delete']);
     expect(r.status).toBe(2);
     expect(r.stderr).toContain('could not delete the Dial key d1');
+    expect(r.stderr).toContain("acts only in the API key's own project");
     expect(deletes()).toHaveLength(1);
   });
 
@@ -660,6 +693,9 @@ esac
         { id: 'n1', name: null, hostPattern: 'api.getdial.ai' },
         { id: 'u1', name: 42, hostPattern: 'API.GETDIAL.AI' },
         { id: 'w1', name: 'wildcard', hostPattern: '*.getdial.ai' },
+        { id: 'w2', name: 'trailing', hostPattern: 'api.getdial.a*' },
+        { id: 'h4', name: 'Dial API', hostPattern: 'getdial.ai' },
+        { id: 'h5', name: 'Dial API', hostPattern: '*getdial*' },
         { id: 'h1', name: 'Dial API', hostPattern: 'api.getdial.ai.evil.test' },
         { id: 'h2', name: 'Dial API', hostPattern: 'notgetdial.ai' },
         { id: 'h3', name: 'Dial API', hostPattern: null },
@@ -667,7 +703,7 @@ esac
     };
     const r = dial({ secrets }, ['--delete']);
     expect(r.status).toBe(0);
-    expect(deletes()).toEqual(['d1', 'd2', 'n1', 'u1', 'w1'].map((id) => `${GW} secrets delete --id ${id}`));
+    expect(deletes()).toEqual(['d1', 'd2', 'n1', 'u1', 'w1', 'w2'].map((id) => `${GW} secrets delete --id ${id}`));
     expect(r.stdout).toContain('d2 "old key; $(touch pwned) `id` *\\n\\u001b[2Jfake: keep"');
     expect(r.stdout).not.toContain('\u001b');
   });
