@@ -798,6 +798,8 @@ esac
     ],
     ['a container bound to another address', { ports: { '10254/tcp': [{ HostIp: '10.0.0.5', HostPort: '10254' }] } }],
     ['a container on a remote Docker daemon', { dockerHost: 'ssh://other-host' }],
+    ['a container bound only on IPv6', { ports: { '10254/tcp': [{ HostIp: '::', HostPort: '10254' }] } }],
+    ['a container with only a UDP binding', { ports: { '10254/udp': [{ HostIp: '127.0.0.1', HostPort: '10254' }] } }],
     ['a container on a remote Docker daemon (DOCKER_HOST)', { env: { DOCKER_HOST: 'tcp://10.0.0.5:2375' } }],
   ])('deletes when the gateway container cannot be shown to be $GW (%s): its old rules may decide', (_n, opts) => {
     const r = dial({ rules: [], ...opts });
