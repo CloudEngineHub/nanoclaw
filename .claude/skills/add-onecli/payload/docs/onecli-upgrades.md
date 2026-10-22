@@ -49,13 +49,21 @@ The conversion runs for every project on the gateway. A local gateway has one; i
 
 If it stops with findings, do not upgrade yet: after the upgrade, access can only be narrowed by detaching secrets from agents, so anything a rule, a rate limit or a `block` default enforced is gone. Note what each finding protects, and upgrade only once you accept that or have a replacement.
 
-Then, on every upgrade, delete any Dial key before you pull, with the command below. `/add-dial-tool` keeps unchosen agents away from Dial with a `block` rule (`Dial: blocked agents`, one of the findings above); the conversion deletes it and would give the key to every agent, OneCLI's default agent included, and Dial spends money and reaches real people. The command asks the gateway at `$GW`, like the check above, and prints `none` when there is no Dial key. If it deleted one, no agent can use Dial until you re-run `/add-dial-tool` after the upgrade, a few minutes later: it recreates the key from the host's Dial sign-in and attaches it only to the agents you choose. On a gateway shared with another install, that install loses Dial too until it re-runs `/add-dial-tool`.
+Then, on every upgrade, check whether the Dial key must go before you pull. An earlier `/add-dial-tool` kept unchosen agents away from Dial with a `block` rule (`Dial: blocked agents`, one of the findings above); the conversion deletes it and would give the key to every agent that rule kept away, and Dial spends money and reaches real people. The check reads only and asks the gateway at `$GW`, like the check above. It prints `delete` and the Dial key ids only when the gateway has not converted yet (it runs 1.43 or older), it holds a Dial key, and the pre-upgrade check lists something the conversion deletes or changes. Otherwise it prints `keep` and why: a gateway on 1.44 or later, for example, has already converted, and its grants decide which agents hold the key.
 
 ```bash
-(export ONECLI_API_HOST="${GW:?set GW as in the Detect step}"; L=$(onecli secrets list --max 0) && [ -n "$(printf '%s' "$L" | tr -d '[:space:]')" ] && ids=$(printf '%s' "$L" | jq -r '(if type == "array" then . elif (type == "object") and ((.data | type) == "array") then .data else error("not a secret list") end)[] | select(.hostPattern == "api.getdial.ai" and (.name | test("(?i)dial"))) | .id') || { echo "STOP: could not read the OneCLI secrets" >&2; exit 2; }; for id in $(printf '%s' "$ids"); do onecli secrets delete --id "$id" || exit 1; done; echo "Dial keys deleted: ${ids:-none}")
+GW="$GW" sh .claude/skills/add-onecli/scripts/dial-key-check.sh
 ```
 
-If you have already upgraded with the key in place, delete it now with the command above, then re-run `/add-dial-tool`: deleting it takes it from every agent at once, OneCLI's default agent included, even if the re-run waits on a Dial sign-in.
+If it prints `keep`, do not delete the Dial key: that takes Dial from every agent that holds it, on every install that shares the gateway, until each one re-runs `/add-dial-tool`. If it stops, do not upgrade yet. If it prints `delete`, delete the key with the same script, which checks again and deletes only the keys that check names:
+
+```bash
+GW="$GW" sh .claude/skills/add-onecli/scripts/dial-key-check.sh --delete
+```
+
+No agent can use Dial until you re-run `/add-dial-tool` after the upgrade, a few minutes later: it recreates the key from the host's Dial sign-in and attaches it only to the agents you choose. On a gateway shared with another install, that install loses Dial too until it re-runs `/add-dial-tool`.
+
+If the gateway already converted while `Dial: blocked agents` was in place, the agents that rule kept away now hold the Dial key. Re-run `/add-dial-tool` now, on every install that shares the gateway: it detaches the key from the agent groups you do not choose. `onecli agents grants list --id <agent-id>` shows which keys an agent holds.
 
 Write the pin to `~/.onecli/.env`, which Docker Compose reads on every later `docker compose` command. A version given only on the command line is gone after that command, so the next plain `docker compose up` falls back to an older saved value or to `latest`. This keeps the file's other settings and its permissions, and the temporary copy is private to you. The command stops without touching the file when the value is empty or not a version:
 
