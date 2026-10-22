@@ -449,7 +449,7 @@ describe('OneCLI upgrade guide: Dial installs', { timeout: 20_000 }, () => {
   const guide = fs.readFileSync(GUIDE, 'utf8');
   const CHECK = 'GW="$GW" sh .claude/skills/add-onecli/scripts/dial-key-check.sh';
   const SCRIPT = path.resolve(__dirname, '../.claude/skills/add-onecli/scripts/dial-key-check.sh');
-  const GW = 'http://gw-being-upgraded:10254';
+  const GW = 'http://127.0.0.1:10254';
   const DIAL_RULE = {
     name: 'Dial: blocked agents',
     action: 'block',
@@ -498,8 +498,6 @@ describe('OneCLI upgrade guide: Dial installs', { timeout: 20_000 }, () => {
       listExit?: number;
       rules?: unknown[];
       published?: unknown[];
-      legacy?: unknown[];
-      legacyExit?: number;
       gatewayEnv?: string[] | null;
       ports?: unknown;
       defs?: { draft?: unknown; published?: unknown };
@@ -537,7 +535,6 @@ case "$3" in *Ports*) cat "${home}/gateway-ports.json" ;; *Env*) cat "${home}/ga
 `,
       { mode: 0o755 },
     );
-    fs.writeFileSync(path.join(home, 'legacy.json'), JSON.stringify({ hint: 'h', data: opts.legacy ?? [] }));
     fs.writeFileSync(path.join(home, 'default-draft.json'), JSON.stringify(opts.defs?.draft ?? DRAFT_DEFAULT));
     fs.writeFileSync(path.join(home, 'default-published.json'), JSON.stringify(opts.defs?.published ?? PUB_DEFAULT));
     const agents = (opts.modes ?? ['selective']).map((secretMode, i) => ({
@@ -566,7 +563,6 @@ case "$1 $2" in
   "agents list") [ "$3 $4" = "--max 0" ] || exit 7; cat "${home}/agents.json" ;;
   "policy rules") [ "$3 $4" = "list --status" ] || exit 7; [ ${opts.rulesExit ?? 0} = 0 ] || exit ${opts.rulesExit ?? 0}; cat "${home}/rules-$5.json" ;;
   "policy default") [ "$3 $4" = "get --status" ] || exit 7; cat "${home}/default-$5.json" ;;
-  "rules list") [ "$3 $4" = "--max 0" ] || exit 7; [ ${opts.legacyExit ?? 0} = 0 ] || exit ${opts.legacyExit ?? 0}; cat "${home}/legacy.json" ;;
   "config get") [ "$3" = project ] || exit 7; echo '{"key":"project","value":"${opts.cliProject ?? ''}"}' ;;
   *) exit 9 ;;
 esac
@@ -616,7 +612,7 @@ esac
   it('a gateway that has not converted, with a Dial key and a rule the conversion deletes: deletes every key for the Dial host', () => {
     const r = dial({}, ['--delete']);
     expect(r.status).toBe(0);
-    expect(r.stdout).toContain('delete: the gateway at http://gw-being-upgraded:10254 (1.42.0) has not converted yet');
+    expect(r.stdout).toContain(`delete: the gateway at ${GW} (1.42.0) has not converted yet`);
     expect(r.stdout).toContain('rule: block "Dial: blocked agents"');
     expect(deletes()).toEqual([`${GW} secrets delete --id d1`, `${GW} secrets delete --id x1`]);
   });
@@ -698,11 +694,10 @@ esac
     expect(after).toMatch(/older than 1\.42[^\n]*`unknown`[^\n]*1\.24 to 1\.38[^\n]*Dial check[^\n]*1\.42\.0 first/);
   });
 
-  it('stops on a 1.42 project whose rules were never cut over to the policy API (published default has no id)', () => {
-    const r = dial({ defs: { published: { ...PUB_DEFAULT, id: '' } } }, ['--delete']);
-    expect(r.status).toBe(2);
-    expect(r.stderr).toContain('never moved to the policy API');
-    expect(deletes()).toEqual([]);
+  it('deletes on a 1.42 project whose rules were never cut over (published default has no id): the old rules decide', () => {
+    const r = dial({ defs: { published: { ...PUB_DEFAULT, id: '' } }, rules: [] });
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain('never moved to the policy API');
   });
 
   it.each([
@@ -793,151 +788,40 @@ esac
   });
 
   it.each([
+    ['a remote gateway', { gw: 'http://gw.example.test:10254' }],
+    ['no readable container', { gatewayEnv: null }],
     [
-      'a legacy block on the Dial host',
-      {
-        id: 'l1',
-        name: 'Dial: blocked for sales',
-        hostPattern: 'api.getdial.ai',
-        action: 'block',
-        enabled: true,
-        agentId: 'oc-1',
-        rateLimit: null,
-      },
+      'a container that does not publish the port',
+      { ports: { '9999/tcp': [{ HostIp: '127.0.0.1', HostPort: '9999' }] } },
     ],
-    [
-      'a legacy block on every host',
-      {
-        id: 'l2',
-        name: 'lockdown',
-        hostPattern: '*',
-        action: 'block',
-        enabled: true,
-        agentId: 'oc-1',
-        rateLimit: null,
-      },
-    ],
-    [
-      'a legacy rate limit on the Dial host',
-      {
-        id: 'l3',
-        name: 'slow dial',
-        hostPattern: '*.getdial.ai',
-        action: 'rate_limit',
-        enabled: true,
-        agentId: null,
-        rateLimit: 5,
-      },
-    ],
-  ])('deletes when %s remains in the old rules and the gateway container cannot be shown to be $GW', (_n, legacy) => {
-    const cases = [
-      { gatewayEnv: null, gw: 'http://127.0.0.1:10254' },
-      { gw: 'http://gw-being-upgraded:10254' },
-      { gw: 'http://127.0.0.1:10254', ports: { '9999/tcp': [{ HostIp: '127.0.0.1', HostPort: '9999' }] } },
-    ];
-    for (const c of cases) {
-      const r = dial({ rules: [], legacy: [legacy], ...c });
-      expect(r.status).toBe(1);
-      expect(r.stdout).toContain(`legacy rule: ${legacy.action} ${JSON.stringify(legacy.name)}`);
-    }
-  });
-
-  it.each([
-    [
-      'a disabled legacy block',
-      {
-        id: 'l1',
-        name: 'off',
-        hostPattern: 'api.getdial.ai',
-        action: 'block',
-        enabled: false,
-        agentId: null,
-        rateLimit: null,
-      },
-    ],
-    [
-      'a legacy block on another host',
-      {
-        id: 'l2',
-        name: 'other',
-        hostPattern: 'api.example.com',
-        action: 'block',
-        enabled: true,
-        agentId: null,
-        rateLimit: null,
-      },
-    ],
-    [
-      'a plain legacy allow',
-      {
-        id: 'l3',
-        name: 'open',
-        hostPattern: 'api.getdial.ai',
-        action: 'allow',
-        enabled: true,
-        agentId: null,
-        rateLimit: null,
-      },
-    ],
-    [
-      'an app permission (its host is not shown)',
-      {
-        id: 'l4',
-        name: 'no github writes',
-        action: 'block',
-        enabled: true,
-        agentId: null,
-        rateLimit: null,
-        metadata: { source: 'app-permission', provider: 'github' },
-      },
-    ],
-    [
-      'a legacy allow with a rate limit, which only a rate_limit rule enforces',
-      {
-        id: 'l5',
-        name: 'not limited',
-        hostPattern: 'api.getdial.ai',
-        action: 'allow',
-        enabled: true,
-        agentId: null,
-        rateLimit: 5,
-      },
-    ],
-  ])('keeps with %s, even when the old rules count', (_n, legacy) => {
-    expect(dial({ rules: [], legacy: [legacy] }).status).toBe(0);
+    ['a container bound to another address', { ports: { '10254/tcp': [{ HostIp: '10.0.0.5', HostPort: '10254' }] } }],
+  ])('deletes when the gateway container cannot be shown to be $GW (%s): its old rules may decide', (_n, opts) => {
+    const r = dial({ rules: [], ...opts });
+    expect(r.status).toBe(1);
+    expect(r.stdout).toContain('could not be shown to be the gateway at');
+    expect(calls().some((l) => l.includes(' policy '))).toBe(false);
   });
 
   it('deletes while the gateway runs with POLICY_ENFORCE_V2 off: the old rules decide, and their deny mode is not readable', () => {
     for (const env of ['POLICY_ENFORCE_V2=0', 'POLICY_ENFORCE_V2=', 'POLICY_ENFORCE_V2=off']) {
-      const r = dial({ rules: [], legacy: [], gw: 'http://127.0.0.1:10254', gatewayEnv: [env] });
+      const r = dial({ rules: [], gatewayEnv: [env] });
       expect(r.status).toBe(1);
       expect(r.stdout).toContain('POLICY_ENFORCE_V2 is off');
     }
   });
 
   it.each([[['PATH=/usr/bin']], [['POLICY_ENFORCE_V2=1']], [['POLICY_ENFORCE_V2=true']]])(
-    'ignores old rules while the gateway enforces its policy (%j)',
+    'reads only the policy while its own container enforces it (%j)',
     (gatewayEnv) => {
-      const stale = {
-        id: 'l1',
-        name: 'Dial: blocked for sales',
-        hostPattern: 'api.getdial.ai',
-        action: 'block',
-        enabled: true,
-        agentId: 'oc-1',
-        rateLimit: null,
-      };
-      const r = dial({ rules: [], legacy: [stale], gatewayEnv, gw: 'http://127.0.0.1:10254' }, ['--delete']);
+      const r = dial({ rules: [], gatewayEnv }, ['--delete']);
       expect(r.status).toBe(0);
       expect(deletes()).toEqual([]);
       expect(calls().some((l) => l.includes(' rules list --max 0'))).toBe(false);
     },
   );
 
-  it('stops when the old rules cannot be read', () => {
-    const r = dial({ rules: [], legacyExit: 1, gatewayEnv: null }, ['--delete']);
-    expect(r.status).toBe(2);
-    expect(deletes()).toEqual([]);
+  it('trusts a container that publishes the port on every address', () => {
+    expect(dial({ rules: [], ports: { '10254/tcp': [{ HostIp: '0.0.0.0', HostPort: '10254' }] } }).status).toBe(0);
   });
 
   it('stops before deleting anything when a Dial key belongs to the organization (its delete acts on the project)', () => {
@@ -967,6 +851,13 @@ esac
     expect(r.status).toBe(2);
     expect(r.stderr).toMatch(/deleted already: d1/);
     expect(r.stderr).toMatch(/left: x1/);
+  });
+
+  it('a first delete that fails still warns: it may have gone through', () => {
+    const r = dial({ deleteExit: 1 }, ['--delete']);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('may still have gone through');
+    expect(r.stderr).toMatch(/deleted already: none; left: d1 x1/);
   });
 
   it('deletes on a block default, and on a Dial rule only the published policy holds', () => {

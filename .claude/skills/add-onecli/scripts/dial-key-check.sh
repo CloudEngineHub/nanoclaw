@@ -54,8 +54,9 @@ GONE='select((.isDefault | not) and ((.source == "blocklist") | not)) | if (.tar
 LIMIT='select((.enabled != false) and ((.action != "allow") or (.requireApproval == true) or ((.rateLimit == null) | not)))'
 TOUCH='select(any(.targets[]; (.kind == "network" and (((.hostPattern | type) != "string") or (.hostPattern | hm("api.getdial.ai")))) or (.kind == "secret" and (((.secretId | type) != "string") or (.secretId as $s | any($ids[]; . == $s))))))'
 # Whose rules decide today. 1.42 enforces its policy unless POLICY_ENFORCE_V2 is
-# set to anything but 1 or true; then the old pre-1.42 rules decide. The gateway
-# container's settings count only when it publishes $GW's port on a local address.
+# set to anything but 1 or true; then the old pre-1.42 rules decide, and their
+# deny mode is not readable. The container's settings count only when it publishes
+# $GW's port on a local address; otherwise the old rules may decide.
 mode=unknown
 C=${ONECLI_GATEWAY_CONTAINER:-onecli}
 hp=${GW#*://}; hp=${hp%%/*}; gh=${hp%:*}; gp=${hp##*:}
@@ -74,30 +75,26 @@ if [ "$S" = old ]; then
   hits="  it runs $V, older than 1.42: there is no policy to show what keeps agents away from Dial, and moving it to 1.42 or later can open Dial"
 elif [ "$mode" = old ]; then
   hits="  POLICY_ENFORCE_V2 is off in $C, so the old pre-1.42 rules decide, and their deny mode is not readable"
+elif [ "$mode" = unknown ]; then
+  hits="  the container $C could not be shown to be the gateway at $GW, so its old pre-1.42 rules may decide, and their deny mode is not readable"
 else
+  # A project whose published policy lacks its default was never cut over: OneCLI
+  # still decides it with the old rules.
+  d=$(onecli policy default get --status published) && [ -n "$d" ] || stop "could not read the published default at $GW"
+  cut=$(printf '%s' "$d" | jq -r 'if type == "object" then ((.id | type) == "string" and (.id | length) > 0) else error("") end') || stop "could not parse the published default at $GW"
+  [ "$cut" = true ] || hits="  the $P at $GW was never moved to the policy API, so its old pre-1.42 rules decide, and their deny mode is not readable"
+fi
+if [ -z "$hits" ]; then
   for st in draft published; do
     r=$(onecli policy rules list --status "$st") && [ -n "$r" ] || stop "could not read the $st rules at $GW"
     d=$(onecli policy default get --status "$st") && [ -n "$d" ] || stop "could not read the $st default at $GW"
     act=$(printf '%s' "$d" | jq -er 'if (type == "object") and ((.action | type) == "string") then .action else error("") end') || stop "could not parse the $st default at $GW"
-    if [ "$st" = published ]; then
-      printf '%s' "$d" | jq -e '(.id | type) == "string" and (.id | length) > 0' >/dev/null \
-        || stop "the $P at $GW was never moved to the policy API (its rules are still the pre-1.42 ones, which this check cannot read): look for policy-oss-cutover in the gateway log"
-    fi
     h=$(printf '%s' "$r" | jq -r --argjson ids "$J" "$HM ($LIST)[] | if type == \"object\" then . else error(\"\") end | $GONE | $LIMIT | $TOUCH | \"  rule: \\(.action | tostring) \\(.name | tojson) ($st)\"") || stop "could not parse the $st rules at $GW"
     [ "$act" = block ] && h="$h
   default: block ($st)"
     hits="$hits
 $h"
   done
-  if [ "$mode" = unknown ]; then
-    # The gateway may run with the old rules; count those that restrict Dial. App-
-    # permission rows hide their host; custom rows always carry one.
-    lr=$(onecli rules list --max 0) && [ -n "$lr" ] || stop "could not read the old (pre-1.42) rules at $GW"
-    h=$(printf '%s' "$lr" | jq -r "$HM ($LIST)[] | if type == \"object\" then . else error(\"\") end | select((.enabled != false) and (.action != \"allow\")) | select((.hostPattern | type) == \"string\" and (.hostPattern | hm(\"api.getdial.ai\"))) | \"  legacy rule: \\(.action | tostring) \\(.name | tojson) (counted: $C could not be shown to be the gateway at $GW)\"") \
-      || stop "could not parse the old (pre-1.42) rules at $GW"
-    hits="$hits
-$h"
-  fi
 fi
 [ -n "$(printf '%s' "$hits" | tr -d '[:space:]')" ] || { echo "keep: nothing the conversion removes at $GW in the $P touches Dial, so no agent gains the Dial key"; exit 0; }
 # Only an exact host or `*.<...>.getdial.ai` stays inside Dial's domain.
@@ -115,9 +112,9 @@ printf '%s' "$L" | jq -r "$DIAL | \"\\(.id) \\(.name | tojson)\""
 # in place, so the delete is still the one the conversion called for.
 done=; rest=$(printf '%s ' $ids)
 for id in $ids; do
-  [ -z "$done" ] || PARTIAL=". Dial keys deleted already: $done; left: $rest. A rule that kept agents away from a deleted key may be gone with it, so delete the keys left in the OneCLI console before anything restarts the gateway"
   read_version
   [ "$S" != converted ] || stop "the gateway at $GW now runs $V, so it has converted; the Dial key $id was kept"
+  PARTIAL=". A failed delete may still have gone through. Dial keys deleted already: ${done:-none}; left: ${rest% }. A rule that kept agents away from a deleted key goes with it, so check \`onecli secrets list\` and delete the Dial keys left in the OneCLI console before anything restarts the gateway"
   onecli secrets delete --id "$id" >/dev/null \
     || stop "could not delete the Dial key $id (\`onecli secrets delete\` acts only in the API key's own project)"
   echo "deleted Dial key $id"
