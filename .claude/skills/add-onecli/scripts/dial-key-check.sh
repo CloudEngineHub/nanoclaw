@@ -69,13 +69,24 @@ for st in draft published; do
   hits="$hits
 $h"
 done
-# The old rules stay readable on 1.42 and apply instead of the policy when the
-# gateway runs with POLICY_ENFORCE_V2=0; 1.44 drops them.
-lr=$(onecli rules list --max 0) && [ -n "$lr" ] || stop "could not read the old (pre-1.42) rules at $GW"
-h=$(printf '%s' "$lr" | jq -r "$HM ($LIST)[] | if type == \"object\" then . else error(\"\") end | select((.enabled != false) and ((.action != \"allow\") or ((.rateLimit == null) | not))) | select(((.hostPattern | type) != \"string\") or (.hostPattern | hm(\"api.getdial.ai\"))) | \"  legacy rule: \\(.action | tostring) \\(.name | tojson)\"") \
-  || stop "could not parse the old (pre-1.42) rules at $GW"
-hits="$hits
+# The old pre-1.42 rules decide instead of the policy only while the gateway runs
+# with POLICY_ENFORCE_V2 set to anything but 1 or true (1.44 drops them). When the
+# local gateway container's settings cannot be read, count them anyway.
+why="the gateway's settings could not be read"
+if E=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "${ONECLI_GATEWAY_CONTAINER:-onecli}" 2>/dev/null); then
+  case "$(printf '%s\n' "$E" | grep '^POLICY_ENFORCE_V2=' | tail -1)" in
+    "" | POLICY_ENFORCE_V2=1 | POLICY_ENFORCE_V2=true) why= ;;
+    *) why="POLICY_ENFORCE_V2 is off, so they apply" ;;
+  esac
+fi
+if [ -n "$why" ]; then
+  # App-permission rows hide their host; custom rows always carry one.
+  lr=$(onecli rules list --max 0) && [ -n "$lr" ] || stop "could not read the old (pre-1.42) rules at $GW"
+  h=$(printf '%s' "$lr" | jq -r --arg why "$why" "$HM ($LIST)[] | if type == \"object\" then . else error(\"\") end | select((.enabled != false) and ((.action != \"allow\") or ((.rateLimit == null) | not))) | select((.hostPattern | type) == \"string\" and (.hostPattern | hm(\"api.getdial.ai\"))) | \"  legacy rule: \\(.action | tostring) \\(.name | tojson) (\\(\$why))\"") \
+    || stop "could not parse the old (pre-1.42) rules at $GW"
+  hits="$hits
 $h"
+fi
 [ -n "$(printf '%s' "$hits" | tr -d '[:space:]')" ] || { echo "keep: nothing the conversion removes at $GW in the $P touches Dial, so no agent gains the Dial key"; exit 0; }
 # Only an exact host or `*.<...>.getdial.ai` stays inside Dial's domain.
 other=$(printf '%s' "$L" | jq -r "$DIAL | select(.hostPattern | ascii_downcase | (index(\"*\") == null) or (.[index(\"*\") + 1:] | endswith(\".getdial.ai\")) | not) | \"\\(.id) \\(.hostPattern | tojson)\"") || stop "could not read the OneCLI secrets"

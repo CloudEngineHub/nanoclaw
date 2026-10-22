@@ -500,6 +500,7 @@ describe('OneCLI upgrade guide: Dial installs', { timeout: 20_000 }, () => {
       published?: unknown[];
       legacy?: unknown[];
       legacyExit?: number;
+      gatewayEnv?: string[] | null;
       defs?: { draft?: unknown; published?: unknown };
       rulesExit?: number;
       deleteExit?: number;
@@ -517,6 +518,19 @@ describe('OneCLI upgrade guide: Dial installs', { timeout: 20_000 }, () => {
     fs.writeFileSync(
       path.join(home, 'rules-published.json'),
       JSON.stringify(opts.published ?? opts.rules ?? [DIAL_RULE]),
+    );
+    fs.writeFileSync(
+      path.join(home, 'gateway-env.txt'),
+      (opts.gatewayEnv ?? ['PATH=/usr/bin', 'NODE_ENV=production']).join('\n'),
+    );
+    fs.writeFileSync(
+      path.join(bin, 'docker'),
+      `#!/bin/sh
+echo "docker $*" >> "${home}/calls.log"
+[ "$1" = inspect ] && [ "${opts.gatewayEnv === null ? 'no' : 'yes'}" = yes ] || exit 1
+cat "${home}/gateway-env.txt"
+`,
+      { mode: 0o755 },
     );
     fs.writeFileSync(path.join(home, 'legacy.json'), JSON.stringify({ hint: 'h', data: opts.legacy ?? [] }));
     fs.writeFileSync(path.join(home, 'default-draft.json'), JSON.stringify(opts.defs?.draft ?? DRAFT_DEFAULT));
@@ -787,7 +801,7 @@ esac
       {
         id: 'l2',
         name: 'lockdown',
-        hostPattern: null,
+        hostPattern: '*',
         action: 'block',
         enabled: true,
         agentId: 'oc-1',
@@ -807,11 +821,13 @@ esac
       },
     ],
   ])(
-    'deletes when %s remains in the old rules (enforced if the gateway runs with POLICY_ENFORCE_V2=0)',
+    'deletes when %s remains in the old rules and the gateway runs with POLICY_ENFORCE_V2 off, or its settings cannot be read',
     (_n, legacy) => {
-      const r = dial({ rules: [], legacy: [legacy] });
-      expect(r.status).toBe(1);
-      expect(r.stdout).toContain(`legacy rule: ${legacy.action} ${JSON.stringify(legacy.name)}`);
+      for (const gatewayEnv of [['POLICY_ENFORCE_V2=0'], ['POLICY_ENFORCE_V2='], null]) {
+        const r = dial({ rules: [], legacy: [legacy], gatewayEnv });
+        expect(r.status).toBe(1);
+        expect(r.stdout).toContain(`legacy rule: ${legacy.action} ${JSON.stringify(legacy.name)}`);
+      }
     },
   );
 
@@ -852,12 +868,43 @@ esac
         rateLimit: null,
       },
     ],
-  ])('keeps with %s', (_n, legacy) => {
-    expect(dial({ rules: [], legacy: [legacy] }).status).toBe(0);
+    [
+      'an app permission (its host is not shown)',
+      {
+        id: 'l4',
+        name: 'no github writes',
+        action: 'block',
+        enabled: true,
+        agentId: null,
+        rateLimit: null,
+        metadata: { source: 'app-permission', provider: 'github' },
+      },
+    ],
+  ])('keeps with %s, even with POLICY_ENFORCE_V2 off', (_n, legacy) => {
+    expect(dial({ rules: [], legacy: [legacy], gatewayEnv: ['POLICY_ENFORCE_V2=false'] }).status).toBe(0);
   });
 
+  it.each([[['PATH=/usr/bin']], [['POLICY_ENFORCE_V2=1']], [['POLICY_ENFORCE_V2=true']]])(
+    'ignores old rules while the gateway enforces its policy (%j)',
+    (gatewayEnv) => {
+      const stale = {
+        id: 'l1',
+        name: 'Dial: blocked for sales',
+        hostPattern: 'api.getdial.ai',
+        action: 'block',
+        enabled: true,
+        agentId: 'oc-1',
+        rateLimit: null,
+      };
+      const r = dial({ rules: [], legacy: [stale], gatewayEnv }, ['--delete']);
+      expect(r.status).toBe(0);
+      expect(deletes()).toEqual([]);
+      expect(calls().some((l) => l.startsWith(`${GW} rules list`))).toBe(false);
+    },
+  );
+
   it('stops when the old rules cannot be read', () => {
-    const r = dial({ rules: [], legacyExit: 1 }, ['--delete']);
+    const r = dial({ rules: [], legacyExit: 1, gatewayEnv: null }, ['--delete']);
     expect(r.status).toBe(2);
     expect(deletes()).toEqual([]);
   });
@@ -917,7 +964,7 @@ esac
     const r = dial({ env: { ONECLI_PROJECT: 'proj-b' } }, ['--delete']);
     expect(r.status).toBe(0);
     expect(r.stdout).toContain('Dial keys in the project proj-b');
-    const onecli = calls().filter((l) => !l.startsWith('curl '));
+    const onecli = calls().filter((l) => !l.startsWith('curl ') && !l.startsWith('docker '));
     expect(onecli.length).toBeGreaterThan(0);
     expect(onecli.every((l) => l.startsWith(`${GW} `))).toBe(true);
     expect(
