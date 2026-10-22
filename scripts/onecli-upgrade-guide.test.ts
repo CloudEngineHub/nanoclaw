@@ -501,6 +501,7 @@ describe('OneCLI upgrade guide: Dial installs', { timeout: 20_000 }, () => {
       legacy?: unknown[];
       legacyExit?: number;
       gatewayEnv?: string[] | null;
+      ports?: unknown;
       defs?: { draft?: unknown; published?: unknown };
       rulesExit?: number;
       deleteExit?: number;
@@ -520,6 +521,10 @@ describe('OneCLI upgrade guide: Dial installs', { timeout: 20_000 }, () => {
       JSON.stringify(opts.published ?? opts.rules ?? [DIAL_RULE]),
     );
     fs.writeFileSync(
+      path.join(home, 'gateway-ports.json'),
+      JSON.stringify(opts.ports ?? { '10254/tcp': [{ HostIp: '127.0.0.1', HostPort: '10254' }], '5432/tcp': null }),
+    );
+    fs.writeFileSync(
       path.join(home, 'gateway-env.txt'),
       (opts.gatewayEnv ?? ['PATH=/usr/bin', 'NODE_ENV=production']).join('\n'),
     );
@@ -528,7 +533,7 @@ describe('OneCLI upgrade guide: Dial installs', { timeout: 20_000 }, () => {
       `#!/bin/sh
 echo "docker $*" >> "${home}/calls.log"
 [ "$1" = inspect ] && [ "${opts.gatewayEnv === null ? 'no' : 'yes'}" = yes ] || exit 1
-cat "${home}/gateway-env.txt"
+case "$3" in *Ports*) cat "${home}/gateway-ports.json" ;; *Env*) cat "${home}/gateway-env.txt" ;; *) exit 7 ;; esac
 `,
       { mode: 0o755 },
     );
@@ -669,13 +674,17 @@ esac
     ['reports unknown (OneCLI 1.24 to 1.38)', { version: 'unknown' }],
     ['reports no version (older than 1.24)', { healths: ['{"status":"ok"}'] }],
     ['runs 1.41.0', { version: '1.41.0' }],
-  ])('a gateway that %s and holds a Dial key stops, telling the operator to move it to 1.42.0 first', (_n, opts) => {
-    const r = dial(opts, ['--delete']);
-    expect(r.status).toBe(2);
-    expect(r.stderr).toMatch(/older than 1\.42.*move it to 1\.42\.0 first/);
-    expect(deletes()).toEqual([]);
-    expect(calls().some((l) => l.includes(' policy '))).toBe(false);
-  });
+  ])(
+    'a gateway that %s and holds a Dial key: delete, since it has no policy to read and moving it can open Dial',
+    (_n, opts) => {
+      const r = dial(opts);
+      expect(r.status).toBe(1);
+      expect(r.stdout).toMatch(/older than 1\.42/);
+      expect(calls().some((l) => l.includes(' policy '))).toBe(false);
+      expect(dial(opts, ['--delete']).status).toBe(0);
+      expect(deletes()).toEqual([`${GW} secrets delete --id d1`, `${GW} secrets delete --id x1`]);
+    },
+  );
 
   it('a gateway older than 1.42 with no Dial key keeps', () => {
     const r = dial({ version: 'unknown', secrets: { data: [SECRETS.data[2]] } }, ['--delete']);
@@ -686,7 +695,7 @@ esac
   it('the guide tells a gateway older than 1.42, one that reports unknown included, to move to 1.42.0 first', () => {
     const pre = guide.indexOf('GW="$GW" sh .claude/skills/add-onecli/scripts/pre-upgrade-check.sh');
     const after = guide.slice(pre, guide.indexOf(`${CHECK}\n`));
-    expect(after).toMatch(/older than 1\.42[^\n]*`unknown`[^\n]*1\.24 to 1\.38[^\n]*1\.42\.0 first/);
+    expect(after).toMatch(/older than 1\.42[^\n]*`unknown`[^\n]*1\.24 to 1\.38[^\n]*Dial check[^\n]*1\.42\.0 first/);
   });
 
   it('stops on a 1.42 project whose rules were never cut over to the policy API (published default has no id)', () => {
@@ -814,22 +823,24 @@ esac
         id: 'l3',
         name: 'slow dial',
         hostPattern: '*.getdial.ai',
-        action: 'allow',
+        action: 'rate_limit',
         enabled: true,
         agentId: null,
         rateLimit: 5,
       },
     ],
-  ])(
-    'deletes when %s remains in the old rules and the gateway runs with POLICY_ENFORCE_V2 off, or its settings cannot be read',
-    (_n, legacy) => {
-      for (const gatewayEnv of [['POLICY_ENFORCE_V2=0'], ['POLICY_ENFORCE_V2='], null]) {
-        const r = dial({ rules: [], legacy: [legacy], gatewayEnv });
-        expect(r.status).toBe(1);
-        expect(r.stdout).toContain(`legacy rule: ${legacy.action} ${JSON.stringify(legacy.name)}`);
-      }
-    },
-  );
+  ])('deletes when %s remains in the old rules and the gateway container cannot be shown to be $GW', (_n, legacy) => {
+    const cases = [
+      { gatewayEnv: null, gw: 'http://127.0.0.1:10254' },
+      { gw: 'http://gw-being-upgraded:10254' },
+      { gw: 'http://127.0.0.1:10254', ports: { '9999/tcp': [{ HostIp: '127.0.0.1', HostPort: '9999' }] } },
+    ];
+    for (const c of cases) {
+      const r = dial({ rules: [], legacy: [legacy], ...c });
+      expect(r.status).toBe(1);
+      expect(r.stdout).toContain(`legacy rule: ${legacy.action} ${JSON.stringify(legacy.name)}`);
+    }
+  });
 
   it.each([
     [
@@ -880,8 +891,28 @@ esac
         metadata: { source: 'app-permission', provider: 'github' },
       },
     ],
-  ])('keeps with %s, even with POLICY_ENFORCE_V2 off', (_n, legacy) => {
-    expect(dial({ rules: [], legacy: [legacy], gatewayEnv: ['POLICY_ENFORCE_V2=false'] }).status).toBe(0);
+    [
+      'a legacy allow with a rate limit, which only a rate_limit rule enforces',
+      {
+        id: 'l5',
+        name: 'not limited',
+        hostPattern: 'api.getdial.ai',
+        action: 'allow',
+        enabled: true,
+        agentId: null,
+        rateLimit: 5,
+      },
+    ],
+  ])('keeps with %s, even when the old rules count', (_n, legacy) => {
+    expect(dial({ rules: [], legacy: [legacy] }).status).toBe(0);
+  });
+
+  it('deletes while the gateway runs with POLICY_ENFORCE_V2 off: the old rules decide, and their deny mode is not readable', () => {
+    for (const env of ['POLICY_ENFORCE_V2=0', 'POLICY_ENFORCE_V2=', 'POLICY_ENFORCE_V2=off']) {
+      const r = dial({ rules: [], legacy: [], gw: 'http://127.0.0.1:10254', gatewayEnv: [env] });
+      expect(r.status).toBe(1);
+      expect(r.stdout).toContain('POLICY_ENFORCE_V2 is off');
+    }
   });
 
   it.each([[['PATH=/usr/bin']], [['POLICY_ENFORCE_V2=1']], [['POLICY_ENFORCE_V2=true']]])(
@@ -896,10 +927,10 @@ esac
         agentId: 'oc-1',
         rateLimit: null,
       };
-      const r = dial({ rules: [], legacy: [stale], gatewayEnv }, ['--delete']);
+      const r = dial({ rules: [], legacy: [stale], gatewayEnv, gw: 'http://127.0.0.1:10254' }, ['--delete']);
       expect(r.status).toBe(0);
       expect(deletes()).toEqual([]);
-      expect(calls().some((l) => l.startsWith(`${GW} rules list`))).toBe(false);
+      expect(calls().some((l) => l.includes(' rules list --max 0'))).toBe(false);
     },
   );
 
