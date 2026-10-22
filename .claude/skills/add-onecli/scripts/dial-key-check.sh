@@ -61,6 +61,8 @@ mode=unknown
 C=${ONECLI_GATEWAY_CONTAINER:-onecli}
 hp=${GW#*://}; hp=${hp%%/*}; gh=${hp%:*}; gp=${hp##*:}
 case "$gh" in 127.0.0.1 | localhost | 172.17.0.1) ;; *) gp= ;; esac
+# A Docker daemon on another host could show its own container there.
+case "${DOCKER_HOST:-$(docker context inspect -f '{{.Endpoints.docker.Host}}' 2>/dev/null)}" in unix://* | npipe://*) ;; *) gp= ;; esac
 if [ "$S" = policy ] && [ -n "$gp" ] && [ "$gp" != "$hp" ] \
   && docker inspect -f '{{json .NetworkSettings.Ports}}' "$C" 2>/dev/null \
     | jq -e --arg p "$gp" --arg h "$gh" '[(. // {})[] | (. // [])[] | select(.HostPort == $p and ((.HostIp // "") as $i | any(["", "0.0.0.0", "::", $h] + (if $h == "localhost" then ["127.0.0.1", "::1"] else [] end) | .[]; . == $i)))] | length > 0' >/dev/null 2>&1 \
@@ -112,8 +114,9 @@ printf '%s' "$L" | jq -r "$DIAL | \"\\(.id) \\(.name | tojson)\""
 # in place, so the delete is still the one the conversion called for.
 done=; rest=$(printf '%s ' $ids)
 for id in $ids; do
+  [ -z "$done" ] || PARTIAL=". Dial keys deleted so far: $done; not deleted: ${rest% }"
   read_version
-  [ "$S" != converted ] || stop "the gateway at $GW now runs $V, so it has converted; the Dial key $id was kept"
+  [ "$S" != converted ] || stop "the gateway at $GW now runs $V, so it has converted: keep the Dial keys not deleted, and see \"If the gateway already converted\" in docs/onecli-upgrades.md"
   PARTIAL=". A failed delete may still have gone through. Dial keys deleted already: ${done:-none}; left: ${rest% }. A rule that kept agents away from a deleted key goes with it, so check \`onecli secrets list\` and delete the Dial keys left in the OneCLI console before anything restarts the gateway"
   onecli secrets delete --id "$id" >/dev/null \
     || stop "could not delete the Dial key $id (\`onecli secrets delete\` acts only in the API key's own project)"

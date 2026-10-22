@@ -500,6 +500,7 @@ describe('OneCLI upgrade guide: Dial installs', { timeout: 20_000 }, () => {
       published?: unknown[];
       gatewayEnv?: string[] | null;
       ports?: unknown;
+      dockerHost?: string;
       defs?: { draft?: unknown; published?: unknown };
       rulesExit?: number;
       deleteExit?: number;
@@ -530,6 +531,7 @@ describe('OneCLI upgrade guide: Dial installs', { timeout: 20_000 }, () => {
       path.join(bin, 'docker'),
       `#!/bin/sh
 echo "docker $*" >> "${home}/calls.log"
+[ "$1 $2" = "context inspect" ] && { echo '${opts.dockerHost ?? 'unix:///var/run/docker.sock'}'; exit 0; }
 [ "$1" = inspect ] && [ "${opts.gatewayEnv === null ? 'no' : 'yes'}" = yes ] || exit 1
 case "$3" in *Ports*) cat "${home}/gateway-ports.json" ;; *Env*) cat "${home}/gateway-env.txt" ;; *) exit 7 ;; esac
 `,
@@ -795,6 +797,8 @@ esac
       { ports: { '9999/tcp': [{ HostIp: '127.0.0.1', HostPort: '9999' }] } },
     ],
     ['a container bound to another address', { ports: { '10254/tcp': [{ HostIp: '10.0.0.5', HostPort: '10254' }] } }],
+    ['a container on a remote Docker daemon', { dockerHost: 'ssh://other-host' }],
+    ['a container on a remote Docker daemon (DOCKER_HOST)', { env: { DOCKER_HOST: 'tcp://10.0.0.5:2375' } }],
   ])('deletes when the gateway container cannot be shown to be $GW (%s): its old rules may decide', (_n, opts) => {
     const r = dial({ rules: [], ...opts });
     expect(r.status).toBe(1);
@@ -956,7 +960,9 @@ esac
   it('re-reads the version before each delete and keeps the rest once the gateway has converted', () => {
     const r = dial({ healths: [health('1.42.0'), health('1.42.0'), health('1.45.0')] }, ['--delete']);
     expect(r.status).toBe(2);
-    expect(r.stderr).toContain('now runs 1.45.0, so it has converted; the Dial key x1 was kept');
+    expect(r.stderr).toContain('now runs 1.45.0, so it has converted: keep the Dial keys not deleted');
+    expect(r.stderr).toContain('Dial keys deleted so far: d1; not deleted: x1');
+    expect(r.stderr).not.toContain('delete the Dial keys left');
     expect(deletes()).toEqual([`${GW} secrets delete --id d1`]);
   });
 
