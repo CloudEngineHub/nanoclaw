@@ -48,7 +48,8 @@ case $? in
   1) ;;
   *) stop "could not read the policy at $GW" ;;
 esac
-other=$(printf '%s' "$L" | jq -r "$DIAL | select(.hostPattern | ascii_downcase | contains(\"getdial\") | not) | \"\\(.id) \\(.hostPattern | tojson)\"") || stop "could not read the OneCLI secrets"
+# Only an exact host or `*.<...>.getdial.ai` stays inside Dial's domain.
+other=$(printf '%s' "$L" | jq -r "$DIAL | select(.hostPattern | ascii_downcase | (index(\"*\") == null) or (.[index(\"*\") + 1:] | endswith(\".getdial.ai\")) | not) | \"\\(.id) \\(.hostPattern | tojson)\"") || stop "could not read the OneCLI secrets"
 [ -z "$other" ] || stop "these secrets reach api.getdial.ai through a wider host pattern, so they are not only Dial keys; decide about them by hand: $other"
 echo "delete: the gateway at $GW ($V) has not converted yet, and the conversion removes what is listed above, which may be what keeps agents away from Dial. Dial keys in the $P (id, name):"
 printf '%s' "$L" | jq -r "$DIAL | \"\\(.id) \\(.name | tojson)\""

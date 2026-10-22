@@ -655,6 +655,14 @@ esac
       { secrets: { data: [SECRETS.data[0], { id: 'w9', name: 'Dial API', hostPattern: 'api.*dial.ai' }] } },
     ],
     [
+      'a secret reaches the Dial host and its look-alikes (*getdial.ai)',
+      { secrets: { data: [SECRETS.data[0], { id: 'w8', name: 'Dial API', hostPattern: '*getdial.ai' }] } },
+    ],
+    [
+      'a secret reaches the Dial host and other domains (api.getdial.a*)',
+      { secrets: { data: [SECRETS.data[0], { id: 'w7', name: 'Dial API', hostPattern: 'api.getdial.a*' }] } },
+    ],
+    [
       'a catch-all secret would be widened',
       { secrets: { data: [SECRETS.data[0], { id: 'c1', name: 'All', hostPattern: '*' }] } },
     ],
@@ -693,7 +701,6 @@ esac
         { id: 'n1', name: null, hostPattern: 'api.getdial.ai' },
         { id: 'u1', name: 42, hostPattern: 'API.GETDIAL.AI' },
         { id: 'w1', name: 'wildcard', hostPattern: '*.getdial.ai' },
-        { id: 'w2', name: 'trailing', hostPattern: 'api.getdial.a*' },
         { id: 'h4', name: 'Dial API', hostPattern: 'getdial.ai' },
         { id: 'h5', name: 'Dial API', hostPattern: '*getdial*' },
         { id: 'h1', name: 'Dial API', hostPattern: 'api.getdial.ai.evil.test' },
@@ -703,7 +710,7 @@ esac
     };
     const r = dial({ secrets }, ['--delete']);
     expect(r.status).toBe(0);
-    expect(deletes()).toEqual(['d1', 'd2', 'n1', 'u1', 'w1', 'w2'].map((id) => `${GW} secrets delete --id ${id}`));
+    expect(deletes()).toEqual(['d1', 'd2', 'n1', 'u1', 'w1'].map((id) => `${GW} secrets delete --id ${id}`));
     expect(r.stdout).toContain('d2 "old key; $(touch pwned) `id` *\\n\\u001b[2Jfake: keep"');
     expect(r.stdout).not.toContain('\u001b');
   });
