@@ -8,7 +8,7 @@
 # (prints the keys); 2: cannot tell. Reads only; --delete deletes those keys.
 set -u
 case "${1:-}" in "" | --delete) ;; *) echo "usage: dial-key-check.sh [--delete]" >&2; exit 2 ;; esac
-stop() { echo "STOP: $1; do not upgrade" >&2; exit 2; }
+stop() { echo "STOP: $1${PARTIAL:-}; do not upgrade" >&2; exit 2; }
 [ -n "${GW:-}" ] || stop "set GW to the gateway address, as in the Detect step"
 export ONECLI_API_HOST="$GW"
 PJ=${ONECLI_PROJECT:-$(onecli config get project 2>/dev/null | jq -r '.value // empty' 2>/dev/null)}
@@ -48,10 +48,11 @@ ids=$(printf '%s' "$L" | jq -r "$DIAL | .id | if (type == \"string\") and test(\
   || stop "could not read the OneCLI secrets"
 [ -n "$ids" ] || { echo "keep: there is no Dial key at $GW in the $P"; exit 0; }
 [ "$S" = policy ] || stop "the gateway at $GW ($V) is older than 1.42, so it has no policy API to show what keeps agents away from Dial: move it to 1.42.0 first, as docs/onecli-upgrades.md describes, then run this guide again"
-# What the conversion removes, as pre-upgrade-check.sh lists it, that can reach a
-# Dial request: a rule on the Dial host or a Dial key, or a `block` default.
+# What the conversion removes, as pre-upgrade-check.sh lists it, that restricts a
+# Dial request today: a rule on the Dial host or a Dial key, or a `block` default.
 J=$(printf '%s' "$ids" | jq -Rsc 'split("\n") | map(select(length > 0))')
 GONE='select((.isDefault | not) and ((.source == "blocklist") | not)) | if (.targets | type) == "array" then . else error("no targets") end | select(any(.targets[]; .kind == "network") or (((.conditions | type) == "array") and ((.conditions | length) > 0)) or ((.action == "allow") and ((.rateLimit == null) | not)) or (any(.targets[]; .kind == "secret") and ((.action != "allow") or (.requireApproval == true))))'
+LIMIT='select((.enabled != false) and ((.action != "allow") or (.requireApproval == true) or ((.rateLimit == null) | not)))'
 TOUCH='select(any(.targets[]; (.kind == "network" and (((.hostPattern | type) != "string") or (.hostPattern | hm("api.getdial.ai")))) or (.kind == "secret" and (((.secretId | type) != "string") or (.secretId as $s | any($ids[]; . == $s))))))'
 hits=
 for st in draft published; do
@@ -62,16 +63,26 @@ for st in draft published; do
     printf '%s' "$d" | jq -e '(.id | type) == "string" and (.id | length) > 0' >/dev/null \
       || stop "the $P at $GW was never moved to the policy API (its rules are still the pre-1.42 ones, which this check cannot read): look for policy-oss-cutover in the gateway log"
   fi
-  h=$(printf '%s' "$r" | jq -r --argjson ids "$J" "$HM ($LIST)[] | if type == \"object\" then . else error(\"\") end | $GONE | $TOUCH | \"  rule: \\(.action | tostring) \\(.name | tojson) ($st)\"") || stop "could not parse the $st rules at $GW"
+  h=$(printf '%s' "$r" | jq -r --argjson ids "$J" "$HM ($LIST)[] | if type == \"object\" then . else error(\"\") end | $GONE | $LIMIT | $TOUCH | \"  rule: \\(.action | tostring) \\(.name | tojson) ($st)\"") || stop "could not parse the $st rules at $GW"
   [ "$act" = block ] && h="$h
   default: block ($st)"
   hits="$hits
 $h"
 done
+# The old rules stay readable on 1.42 and apply instead of the policy when the
+# gateway runs with POLICY_ENFORCE_V2=0; 1.44 drops them.
+lr=$(onecli rules list --max 0) && [ -n "$lr" ] || stop "could not read the old (pre-1.42) rules at $GW"
+h=$(printf '%s' "$lr" | jq -r "$HM ($LIST)[] | if type == \"object\" then . else error(\"\") end | select((.enabled != false) and ((.action != \"allow\") or ((.rateLimit == null) | not))) | select(((.hostPattern | type) != \"string\") or (.hostPattern | hm(\"api.getdial.ai\"))) | \"  legacy rule: \\(.action | tostring) \\(.name | tojson)\"") \
+  || stop "could not parse the old (pre-1.42) rules at $GW"
+hits="$hits
+$h"
 [ -n "$(printf '%s' "$hits" | tr -d '[:space:]')" ] || { echo "keep: nothing the conversion removes at $GW in the $P touches Dial, so no agent gains the Dial key"; exit 0; }
 # Only an exact host or `*.<...>.getdial.ai` stays inside Dial's domain.
 other=$(printf '%s' "$L" | jq -r "$DIAL | select(.hostPattern | ascii_downcase | (index(\"*\") == null) or (.[index(\"*\") + 1:] | endswith(\".getdial.ai\")) | not) | \"\\(.id) \\(.hostPattern | tojson)\"") || stop "could not read the OneCLI secrets"
 [ -z "$other" ] || stop "these secrets reach api.getdial.ai through a wider host pattern, so they are not only Dial keys; decide about them by hand: $other"
+# The list includes organization secrets, but a delete acts on the project only.
+org=$(printf '%s' "$L" | jq -r "$DIAL | select((.scope // \"project\") != \"project\") | \"\\(.id) (\\(.scope | tojson))\"") || stop "could not read the OneCLI secrets"
+[ -z "$org" ] || stop "these Dial keys are not this project's own secrets, and this check can delete only those: $org. Delete them in the OneCLI console before you pull"
 echo "delete: the gateway at $GW ($V) has not converted yet, and the conversion removes what keeps agents away from Dial:"
 printf '%s\n' "$hits" | sed '/^[[:space:]]*$/d'
 echo "Dial keys in the $P (id, name):"
@@ -79,10 +90,13 @@ printf '%s' "$L" | jq -r "$DIAL | \"\\(.id) \\(.name | tojson)\""
 [ "${1:-}" = --delete ] || exit 1
 # A gateway that converts between the last read and a delete had this Dial rule
 # in place, so the delete is still the one the conversion called for.
+done=; rest=$(printf '%s ' $ids)
 for id in $ids; do
+  [ -z "$done" ] || PARTIAL=". Dial keys deleted already: $done; left: $rest. A rule that kept agents away from a deleted key may be gone with it, so delete the keys left in the OneCLI console before anything restarts the gateway"
   read_version
   [ "$S" != converted ] || stop "the gateway at $GW now runs $V, so it has converted; the Dial key $id was kept"
   onecli secrets delete --id "$id" >/dev/null \
-    || stop "could not delete the Dial key $id. \`onecli secrets delete\` acts only in the API key's own project, so in another project delete it in the OneCLI console"
+    || stop "could not delete the Dial key $id (\`onecli secrets delete\` acts only in the API key's own project)"
   echo "deleted Dial key $id"
+  done="${done:+$done }$id"; rest=${rest#"$id "}
 done

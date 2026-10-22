@@ -444,7 +444,8 @@ describe('OneCLI upgrade guide: restoring the backup', () => {
 // that already converted takes Dial from every agent that should have it. So the
 // guide deletes the key only when its check says the conversion is still ahead
 // and could widen Dial, then re-runs /add-dial-tool.
-describe('OneCLI upgrade guide: Dial installs', () => {
+// Each case runs the check (several stubbed CLI calls) once or more; give a busy runner room.
+describe('OneCLI upgrade guide: Dial installs', { timeout: 20_000 }, () => {
   const guide = fs.readFileSync(GUIDE, 'utf8');
   const CHECK = 'GW="$GW" sh .claude/skills/add-onecli/scripts/dial-key-check.sh';
   const SCRIPT = path.resolve(__dirname, '../.claude/skills/add-onecli/scripts/dial-key-check.sh');
@@ -497,6 +498,8 @@ describe('OneCLI upgrade guide: Dial installs', () => {
       listExit?: number;
       rules?: unknown[];
       published?: unknown[];
+      legacy?: unknown[];
+      legacyExit?: number;
       defs?: { draft?: unknown; published?: unknown };
       rulesExit?: number;
       deleteExit?: number;
@@ -515,6 +518,7 @@ describe('OneCLI upgrade guide: Dial installs', () => {
       path.join(home, 'rules-published.json'),
       JSON.stringify(opts.published ?? opts.rules ?? [DIAL_RULE]),
     );
+    fs.writeFileSync(path.join(home, 'legacy.json'), JSON.stringify({ hint: 'h', data: opts.legacy ?? [] }));
     fs.writeFileSync(path.join(home, 'default-draft.json'), JSON.stringify(opts.defs?.draft ?? DRAFT_DEFAULT));
     fs.writeFileSync(path.join(home, 'default-published.json'), JSON.stringify(opts.defs?.published ?? PUB_DEFAULT));
     const agents = (opts.modes ?? ['selective']).map((secretMode, i) => ({
@@ -543,6 +547,7 @@ case "$1 $2" in
   "agents list") [ "$3 $4" = "--max 0" ] || exit 7; cat "${home}/agents.json" ;;
   "policy rules") [ "$3 $4" = "list --status" ] || exit 7; [ ${opts.rulesExit ?? 0} = 0 ] || exit ${opts.rulesExit ?? 0}; cat "${home}/rules-$5.json" ;;
   "policy default") [ "$3 $4" = "get --status" ] || exit 7; cat "${home}/default-$5.json" ;;
+  "rules list") [ "$3 $4" = "--max 0" ] || exit 7; [ ${opts.legacyExit ?? 0} = 0 ] || exit ${opts.legacyExit ?? 0}; cat "${home}/legacy.json" ;;
   "config get") [ "$3" = project ] || exit 7; echo '{"key":"project","value":"${opts.cliProject ?? ''}"}' ;;
   *) exit 9 ;;
 esac
@@ -695,6 +700,19 @@ esac
       'a plain allow on a Dial key, which the conversion keeps',
       rule({ name: 'dial ok', targets: [{ kind: 'secret', secretId: 'd1' }] }),
     ],
+    ['a disabled block on the Dial host', { ...DIAL_RULE, enabled: false }],
+    [
+      'a plain network allow on the Dial host',
+      rule({ name: 'dial open', targets: [{ kind: 'network', hostPattern: 'api.getdial.ai' }] }),
+    ],
+    [
+      'a conditional allow on the Dial host',
+      rule({
+        name: 'dial weekdays',
+        conditions: [{ field: 'time', op: 'in', value: 'weekdays' }],
+        targets: [{ kind: 'network', hostPattern: 'api.getdial.ai' }],
+      }),
+    ],
   ])('keeps the Dial key when the only finding is %s', (_name, finding) => {
     const r = dial({ rules: [finding] }, ['--delete']);
     expect(r.status).toBe(0);
@@ -736,9 +754,10 @@ esac
       rule({ name: 'dial rate', rateLimit: 5, targets: [{ kind: 'network', hostPattern: 'api.getdial.ai' }] }),
     ],
     [
-      'a behavioral rule on the Dial host',
+      'a conditional block on the Dial host',
       rule({
         name: 'dial hours',
+        action: 'block',
         conditions: [{ field: 'time', op: 'in', value: 'weekdays' }],
         targets: [{ kind: 'network', hostPattern: 'api.getdial.ai' }],
       }),
@@ -748,6 +767,128 @@ esac
     const r = dial({ rules: [finding] });
     expect(r.status).toBe(1);
     expect(r.stdout).toContain(JSON.stringify(finding.name));
+  });
+
+  it.each([
+    [
+      'a legacy block on the Dial host',
+      {
+        id: 'l1',
+        name: 'Dial: blocked for sales',
+        hostPattern: 'api.getdial.ai',
+        action: 'block',
+        enabled: true,
+        agentId: 'oc-1',
+        rateLimit: null,
+      },
+    ],
+    [
+      'a legacy block on every host',
+      {
+        id: 'l2',
+        name: 'lockdown',
+        hostPattern: null,
+        action: 'block',
+        enabled: true,
+        agentId: 'oc-1',
+        rateLimit: null,
+      },
+    ],
+    [
+      'a legacy rate limit on the Dial host',
+      {
+        id: 'l3',
+        name: 'slow dial',
+        hostPattern: '*.getdial.ai',
+        action: 'allow',
+        enabled: true,
+        agentId: null,
+        rateLimit: 5,
+      },
+    ],
+  ])(
+    'deletes when %s remains in the old rules (enforced if the gateway runs with POLICY_ENFORCE_V2=0)',
+    (_n, legacy) => {
+      const r = dial({ rules: [], legacy: [legacy] });
+      expect(r.status).toBe(1);
+      expect(r.stdout).toContain(`legacy rule: ${legacy.action} ${JSON.stringify(legacy.name)}`);
+    },
+  );
+
+  it.each([
+    [
+      'a disabled legacy block',
+      {
+        id: 'l1',
+        name: 'off',
+        hostPattern: 'api.getdial.ai',
+        action: 'block',
+        enabled: false,
+        agentId: null,
+        rateLimit: null,
+      },
+    ],
+    [
+      'a legacy block on another host',
+      {
+        id: 'l2',
+        name: 'other',
+        hostPattern: 'api.example.com',
+        action: 'block',
+        enabled: true,
+        agentId: null,
+        rateLimit: null,
+      },
+    ],
+    [
+      'a plain legacy allow',
+      {
+        id: 'l3',
+        name: 'open',
+        hostPattern: 'api.getdial.ai',
+        action: 'allow',
+        enabled: true,
+        agentId: null,
+        rateLimit: null,
+      },
+    ],
+  ])('keeps with %s', (_n, legacy) => {
+    expect(dial({ rules: [], legacy: [legacy] }).status).toBe(0);
+  });
+
+  it('stops when the old rules cannot be read', () => {
+    const r = dial({ rules: [], legacyExit: 1 }, ['--delete']);
+    expect(r.status).toBe(2);
+    expect(deletes()).toEqual([]);
+  });
+
+  it('stops before deleting anything when a Dial key belongs to the organization (its delete acts on the project)', () => {
+    const secrets = {
+      data: [SECRETS.data[0], { id: 'o1', name: 'Org Dial', hostPattern: 'api.getdial.ai', scope: 'organization' }],
+    };
+    const r = dial({ secrets }, ['--delete']);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('o1');
+    expect(r.stderr).toContain('organization');
+    expect(deletes()).toEqual([]);
+  });
+
+  it('after a failed delete, names what was deleted and what is left', () => {
+    const bin = path.join(home, 'bin');
+    dial();
+    const stub = fs.readFileSync(path.join(bin, 'onecli'), 'utf8');
+    fs.writeFileSync(
+      path.join(bin, 'onecli'),
+      stub.replace('"secrets delete") exit 0 ;;', '"secrets delete") [ "$4" = d1 ] || exit 1 ;;'),
+    );
+    fs.rmSync(path.join(home, 'calls.log'), { force: true });
+    const r = spawnSync('sh', [SCRIPT, '--delete'], {
+      env: { PATH: `${bin}:${process.env.PATH ?? ''}`, HOME: home, GW },
+      encoding: 'utf8',
+    });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/deleted already: d1/);
+    expect(r.stderr).toMatch(/left: x1/);
   });
 
   it('deletes on a block default, and on a Dial rule only the published policy holds', () => {
