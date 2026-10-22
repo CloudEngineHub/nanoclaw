@@ -28,7 +28,7 @@ ARG INSTALL_CJK_FONTS=false
 # all users. The global Node CLIs (claude-code, agent-browser) are
 # pinned in cli-tools.json so a skill can add one with a json-merge; Bun (the
 # runtime) is pinned here because it installs from a different source.
-ARG BUN_VERSION=1.4.0
+ARG BUN_VERSION=1.4.4
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -76,9 +76,11 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 # ---- Bun runtime -------------------------------------------------------------
 # Install via the official script (handles multi-arch detection), then move
 # the binary to /usr/local/bin so the non-root `node` user can execute it.
+# The version check fails the build if the script installed anything but the pin.
 RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" && \
     install -m 0755 /root/.bun/bin/bun /usr/local/bin/bun && \
-    rm -rf /root/.bun
+    rm -rf /root/.bun && \
+    test "$(bun --version)" = "${BUN_VERSION}"
 
 # ---- agent-runner deps -------------------------------------------------------
 # Deps are cached independently of CLI versions. Source is NOT baked in —
