@@ -440,6 +440,184 @@ describe('OneCLI upgrade guide: restoring the backup', () => {
   });
 });
 
+// Dial spends money and reaches real people, so the guide's default order for a
+// Dial install is: delete the key before the pull, re-run /add-dial-tool after.
+describe('OneCLI upgrade guide: Dial installs', () => {
+  const guide = fs.readFileSync(GUIDE, 'utf8');
+  const blocks = [...guide.matchAll(/```bash\n([\s\S]*?)```/g)].map((m) => ({ body: m[1], at: m.index ?? 0 }));
+  const del = blocks.find((b) => b.body.includes('api.getdial.ai') && b.body.includes('secrets delete'));
+
+  it('deletes the Dial key before the pull by default, then re-runs /add-dial-tool', () => {
+    expect(del).toBeDefined();
+    expect(del!.at).toBeLessThan(guide.indexOf('docker compose pull onecli'));
+    const before = guide.slice(0, del!.at).trimEnd();
+    const paragraph = before.slice(before.lastIndexOf('\n\n'));
+    expect(paragraph).toMatch(/delete any Dial key before you pull/i);
+    expect(paragraph).toMatch(/every upgrade/);
+    expect(paragraph).toContain('/add-dial-tool');
+    expect(guide).not.toMatch(/To keep every unchosen agent away from Dial in between/);
+  });
+
+  it('the delete removes only Dial keys on api.getdial.ai and stops on a failed delete', () => {
+    const bin = path.join(home, 'bin');
+    fs.mkdirSync(bin, { recursive: true });
+    const LIST =
+      '{"hint":"h","data":[{"id":"d1","name":"Dial API","hostPattern":"api.getdial.ai"},{"id":"x1","name":"Other key","hostPattern":"api.getdial.ai"},{"id":"m1","name":"Anthropic","hostPattern":"api.anthropic.com"}]}';
+    const stub = (deleteExit: number, list = LIST) =>
+      fs.writeFileSync(
+        path.join(bin, 'onecli'),
+        `#!/bin/sh
+echo "$ONECLI_API_HOST $*" >> "${home}/onecli.log"
+case "$1 $2" in
+  "secrets list") [ "$3 $4" = "--max 0" ] || exit 7; echo '${list}' ;;
+  "secrets delete") exit ${deleteExit} ;;
+esac
+`,
+        { mode: 0o755 },
+      );
+    const run = (gw: string | null = 'http://gw-being-upgraded:10254') =>
+      spawnSync('sh', ['-c', del!.body], {
+        env: { PATH: `${bin}:${process.env.PATH ?? ''}`, HOME: home, ...(gw ? { GW: gw } : {}) },
+        encoding: 'utf8',
+      });
+    stub(0);
+    expect(run().status).toBe(0);
+    expect(
+      fs
+        .readFileSync(path.join(home, 'onecli.log'), 'utf8')
+        .trim()
+        .split('\n')
+        .filter((l) => l.includes('secrets delete')),
+    ).toEqual(['http://gw-being-upgraded:10254 secrets delete --id d1']);
+    stub(1);
+    expect(run().status).not.toBe(0);
+  });
+
+  it('the delete asks the gateway being upgraded ($GW), and stops before any call without it', () => {
+    const bin = path.join(home, 'bin');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(path.join(bin, 'onecli'), `#!/bin/sh\necho "$*" >> "${home}/onecli.log"\necho '{"data":[]}'\n`, {
+      mode: 0o755,
+    });
+    const r = spawnSync('sh', ['-c', del!.body], {
+      env: { PATH: `${bin}:${process.env.PATH ?? ''}`, HOME: home },
+      encoding: 'utf8',
+    });
+    expect(r.status).not.toBe(0);
+    expect(fs.existsSync(path.join(home, 'onecli.log'))).toBe(false);
+  });
+
+  it('a secret list it cannot read stops the delete instead of passing as "no Dial keys"', () => {
+    const bin = path.join(home, 'bin');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(path.join(bin, 'onecli'), `#!/bin/sh\necho '{"data":null}'\n`, { mode: 0o755 });
+    const r = spawnSync('sh', ['-c', del!.body], {
+      env: { PATH: `${bin}:${process.env.PATH ?? ''}`, HOME: home, GW: 'http://gw:1' },
+      encoding: 'utf8',
+    });
+    expect(r.status).not.toBe(0);
+  });
+
+  it('nothing gates the delete on a lookup that ignores $GW', () => {
+    const dialSection = guide.slice(guide.indexOf('Dial'), guide.indexOf('docker compose pull onecli'));
+    for (const line of dialSection.split('\n').filter((l) => l.includes('onecli secrets list'))) {
+      expect(line).toContain('ONECLI_API_HOST="${GW:?');
+    }
+  });
+
+  it('a secret list of only whitespace stops the delete', () => {
+    const bin = path.join(home, 'bin');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(path.join(bin, 'onecli'), `#!/bin/sh\nprintf ' \\t\\n'\n`, { mode: 0o755 });
+    const r = spawnSync('sh', ['-c', del!.body], {
+      env: { PATH: `${bin}:${process.env.PATH ?? ''}`, HOME: home, GW: 'http://gw:1' },
+      encoding: 'utf8',
+    });
+    expect(r.status).not.toBe(0);
+  });
+
+  it('a failed secret list (no output) stops the delete', () => {
+    const bin = path.join(home, 'bin');
+    fs.mkdirSync(bin, { recursive: true });
+    fs.writeFileSync(path.join(bin, 'onecli'), `#!/bin/sh\necho "unauthorized" >&2\nexit 1\n`, { mode: 0o755 });
+    const r = spawnSync('sh', ['-c', del!.body], {
+      env: { PATH: `${bin}:${process.env.PATH ?? ''}`, HOME: home, GW: 'http://gw:1' },
+      encoding: 'utf8',
+    });
+    expect(r.status).not.toBe(0);
+    expect(r.stdout).not.toContain('deleted');
+  });
+
+  it.each(['sh', 'bash', 'zsh'].filter((sh) => spawnSync(sh, ['-c', 'true']).status === 0))(
+    'deletes each Dial key separately under %s',
+    (shell) => {
+      const bin = path.join(home, 'bin');
+      fs.mkdirSync(bin, { recursive: true });
+      fs.writeFileSync(
+        path.join(bin, 'onecli'),
+        `#!/bin/sh\necho "$*" >> "${home}/onecli.log"\ncase "$1 $2" in "secrets list") echo '{"data":[{"id":"d1","name":"Dial API","hostPattern":"api.getdial.ai"},{"id":"d2","name":"Old Dial","hostPattern":"api.getdial.ai"}]}' ;; esac\n`,
+        { mode: 0o755 },
+      );
+      fs.rmSync(path.join(home, 'onecli.log'), { force: true });
+      const r = spawnSync(shell, ['-c', del!.body], {
+        env: { PATH: `${bin}:${process.env.PATH ?? ''}`, HOME: home, GW: 'http://gw:1' },
+        encoding: 'utf8',
+      });
+      expect(r.status).toBe(0);
+      const deletes = fs
+        .readFileSync(path.join(home, 'onecli.log'), 'utf8')
+        .trim()
+        .split('\n')
+        .filter((l) => l.startsWith('secrets delete'));
+      expect(deletes).toEqual(['secrets delete --id d1', 'secrets delete --id d2']);
+    },
+  );
+
+  it.each(['bash', 'zsh'].filter((sh) => spawnSync(sh, ['-c', 'true']).status === 0))(
+    'a secret list larger than a pipe buffer still works under %s with pipefail',
+    (shell) => {
+      const bin = path.join(home, 'bin');
+      fs.mkdirSync(bin, { recursive: true });
+      const others = Array.from({ length: 6000 }, (_, i) => ({
+        id: `x${i}`,
+        name: `Other ${i}`,
+        hostPattern: `h${i}.example.com`,
+      }));
+      fs.writeFileSync(
+        path.join(home, 'secrets.json'),
+        JSON.stringify({ data: [...others, { id: 'd1', name: 'Dial API', hostPattern: 'api.getdial.ai' }] }),
+      );
+      fs.writeFileSync(
+        path.join(bin, 'onecli'),
+        `#!/bin/sh\necho "$*" >> "${home}/onecli.log"\ncase "$1 $2" in "secrets list") cat "${home}/secrets.json" ;; esac\n`,
+        { mode: 0o755 },
+      );
+      // GNU grep -q stops reading at its first match, closing the pipe on the writer.
+      fs.writeFileSync(path.join(bin, 'grep'), '#!/bin/sh\nhead -c 1 >/dev/null\n', { mode: 0o755 });
+      fs.rmSync(path.join(home, 'onecli.log'), { force: true });
+      const pipefail = shell === 'zsh' ? 'setopt pipefail' : 'set -o pipefail';
+      const r = spawnSync(shell, ['-c', `${pipefail}\n${del!.body}`], {
+        env: { PATH: `${bin}:${process.env.PATH ?? ''}`, HOME: home, GW: 'http://gw:1' },
+        encoding: 'utf8',
+      });
+      expect(r.stderr).toBe('');
+      expect(r.status).toBe(0);
+      expect(
+        fs
+          .readFileSync(path.join(home, 'onecli.log'), 'utf8')
+          .trim()
+          .split('\n')
+          .filter((l) => l.startsWith('secrets delete')),
+      ).toEqual(['secrets delete --id d1']);
+    },
+  );
+
+  it('an install already upgraded with the key in place deletes it now, before the re-run', () => {
+    const after = guide.slice(guide.indexOf('If you have already upgraded with the key in place'));
+    expect(after.split('\n')[0]).toMatch(/delete it now with the command above, then re-run `\/add-dial-tool`/);
+  });
+});
+
 describe('OneCLI upgrade guide: skills that wrote standing instructions', () => {
   it('tells /add-tavily-tool installs to re-run its Phase 5 once the NanoClaw service is back', () => {
     const guide = fs.readFileSync(GUIDE, 'utf8');
