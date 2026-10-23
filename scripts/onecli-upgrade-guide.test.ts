@@ -531,7 +531,8 @@ describe('OneCLI upgrade guide: Dial installs', { timeout: 20_000 }, () => {
       path.join(bin, 'docker'),
       `#!/bin/sh
 echo "docker $*" >> "${home}/calls.log"
-[ "$1 $2" = "context inspect" ] && { echo '${opts.dockerHost ?? 'unix:///var/run/docker.sock'}'; exit 0; }
+[ "$1 $2" = "context inspect" ] && { echo "\${DOCKER_HOST:-${opts.dockerHost ?? 'unix:///var/run/docker.sock'}}"; exit 0; }
+[ "$1" = -H ] && { [ "$2" = "\${DOCKER_HOST:-${opts.dockerHost ?? 'unix:///var/run/docker.sock'}}" ] || exit 8; shift 2; }
 [ "$1" = inspect ] && [ "${opts.gatewayEnv === null ? 'no' : 'yes'}" = yes ] || exit 1
 case "$3" in *Ports*) cat "${home}/gateway-ports.json" ;; *Env*) cat "${home}/gateway-env.txt" ;; *) exit 7 ;; esac
 `,
@@ -845,6 +846,13 @@ esac
         .filter((l) => !l.startsWith('docker '))
         .every((l) => l.includes('http://[::1]:10254')),
     ).toBe(true);
+  });
+
+  it('inspects the container only through the Docker endpoint it checked', () => {
+    expect(dial({ rules: [] }).status).toBe(0);
+    const inspects = calls().filter((l) => l.startsWith('docker ') && !l.startsWith('docker context '));
+    expect(inspects.length).toBe(2);
+    expect(inspects.every((l) => l.startsWith('docker -H unix:///var/run/docker.sock inspect -f '))).toBe(true);
   });
 
   it('trusts a container that publishes the port on every address', () => {

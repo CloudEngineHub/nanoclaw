@@ -18,9 +18,11 @@ VERIFIED=
 hp=${GW#*://}; hp=${hp%%/*}; gh=${hp%:*}; gp=${hp##*:}
 [ "$gp" != "$hp" ] || gp=
 case "$gh" in 127.0.0.1 | localhost | 172.17.0.1) ;; *) gp= ;; esac
-case "${DOCKER_HOST:-$(docker context inspect -f '{{.Endpoints.docker.Host}}' 2>/dev/null)}" in unix://* | npipe://*) ;; *) gp= ;; esac
+# Every inspect goes to the one endpoint checked here, whatever DOCKER_HOST or DOCKER_CONTEXT say.
+EP=$(docker context inspect -f '{{.Endpoints.docker.Host}}' 2>/dev/null) || EP=
+case "$EP" in unix://* | npipe://*) ;; *) gp= ;; esac
 if [ -n "$gp" ]; then
-  B=$(docker inspect -f '{{json .NetworkSettings.Ports}}' "$C" 2>/dev/null \
+  B=$(docker -H "$EP" inspect -f '{{json .NetworkSettings.Ports}}' "$C" 2>/dev/null \
     | jq -r --arg p "$gp" '[(. // {}) | to_entries[] | select(.key | endswith("/tcp")) | (.value // [])[] | select(.HostPort == $p) | (.HostIp // "") | if . == "" then "0.0.0.0" else . end] | unique | join(" ")' 2>/dev/null) || B=
   case "$gh" in
     localhost) case " $B " in *" 127.0.0.1 "* | *" 0.0.0.0 "*) VERIFIED=127.0.0.1 ;; *" ::1 "* | *" :: "*) VERIFIED="[::1]" ;; esac ;;
@@ -76,7 +78,7 @@ TOUCH='select(any(.targets[]; (.kind == "network" and (((.hostPattern | type) !=
 # deny mode is not readable. Without a verified container the old rules may decide.
 mode=unknown
 if [ "$S" = policy ] && [ -n "$VERIFIED" ] \
-  && E=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$C" 2>/dev/null); then
+  && E=$(docker -H "$EP" inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$C" 2>/dev/null); then
   case "$(printf '%s\n' "$E" | grep '^POLICY_ENFORCE_V2=' | tail -1)" in
     "" | POLICY_ENFORCE_V2=1 | POLICY_ENFORCE_V2=true) mode=policy ;;
     *) mode=old ;;
