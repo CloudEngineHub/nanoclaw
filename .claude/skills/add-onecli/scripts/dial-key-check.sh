@@ -10,6 +10,24 @@ set -u
 case "${1:-}" in "" | --delete) ;; *) echo "usage: dial-key-check.sh [--delete]" >&2; exit 2 ;; esac
 stop() { echo "STOP: $1${PARTIAL:-}; do not upgrade" >&2; exit 2; }
 [ -n "${GW:-}" ] || stop "set GW to the gateway address, as in the Detect step"
+# The gateway container counts as the one at $GW only through a local Docker daemon,
+# on a local address with a TCP binding of $GW's port. A localhost $GW is pinned to
+# the address that binding uses, so every read below reaches that container.
+C=${ONECLI_GATEWAY_CONTAINER:-onecli}
+VERIFIED=
+hp=${GW#*://}; hp=${hp%%/*}; gh=${hp%:*}; gp=${hp##*:}
+[ "$gp" != "$hp" ] || gp=
+case "$gh" in 127.0.0.1 | localhost | 172.17.0.1) ;; *) gp= ;; esac
+case "${DOCKER_HOST:-$(docker context inspect -f '{{.Endpoints.docker.Host}}' 2>/dev/null)}" in unix://* | npipe://*) ;; *) gp= ;; esac
+if [ -n "$gp" ]; then
+  B=$(docker inspect -f '{{json .NetworkSettings.Ports}}' "$C" 2>/dev/null \
+    | jq -r --arg p "$gp" '[(. // {}) | to_entries[] | select(.key | endswith("/tcp")) | (.value // [])[] | select(.HostPort == $p) | (.HostIp // "") | if . == "" then "0.0.0.0" else . end] | unique | join(" ")' 2>/dev/null) || B=
+  case "$gh" in
+    localhost) case " $B " in *" 127.0.0.1 "* | *" 0.0.0.0 "*) VERIFIED=127.0.0.1 ;; *" ::1 "* | *" :: "*) VERIFIED="[::1]" ;; esac ;;
+    *) case " $B " in *" $gh "* | *" 0.0.0.0 "*) VERIFIED=$gh ;; esac ;;
+  esac
+  [ -z "$VERIFIED" ] || GW="${GW%%://*}://$VERIFIED:$gp"
+fi
 export ONECLI_API_HOST="$GW"
 PJ=${ONECLI_PROJECT:-$(onecli config get project 2>/dev/null | jq -r '.value // empty' 2>/dev/null)}
 P="project ${PJ:-of the OneCLI API key}"
@@ -55,17 +73,9 @@ LIMIT='select((.enabled != false) and ((.action != "allow") or (.requireApproval
 TOUCH='select(any(.targets[]; (.kind == "network" and (((.hostPattern | type) != "string") or (.hostPattern | hm("api.getdial.ai")))) or (.kind == "secret" and (((.secretId | type) != "string") or (.secretId as $s | any($ids[]; . == $s))))))'
 # Whose rules decide today. 1.42 enforces its policy unless POLICY_ENFORCE_V2 is
 # set to anything but 1 or true; then the old pre-1.42 rules decide, and their
-# deny mode is not readable. The container's settings count only when it publishes
-# $GW's port on a local address; otherwise the old rules may decide.
+# deny mode is not readable. Without a verified container the old rules may decide.
 mode=unknown
-C=${ONECLI_GATEWAY_CONTAINER:-onecli}
-hp=${GW#*://}; hp=${hp%%/*}; gh=${hp%:*}; gp=${hp##*:}
-case "$gh" in 127.0.0.1 | localhost | 172.17.0.1) ;; *) gp= ;; esac
-# A Docker daemon on another host could show its own container there.
-case "${DOCKER_HOST:-$(docker context inspect -f '{{.Endpoints.docker.Host}}' 2>/dev/null)}" in unix://* | npipe://*) ;; *) gp= ;; esac
-if [ "$S" = policy ] && [ -n "$gp" ] && [ "$gp" != "$hp" ] \
-  && docker inspect -f '{{json .NetworkSettings.Ports}}' "$C" 2>/dev/null \
-    | jq -e --arg p "$gp" --arg h "$gh" '[(. // {}) | to_entries[] | select(.key | endswith("/tcp")) | (.value // [])[] | select(.HostPort == $p and ((.HostIp // "") as $i | any((if $h == "localhost" then ["", "0.0.0.0", "127.0.0.1", "::", "::1"] else ["", "0.0.0.0", $h] end)[]; . == $i)))] | length > 0' >/dev/null 2>&1 \
+if [ "$S" = policy ] && [ -n "$VERIFIED" ] \
   && E=$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$C" 2>/dev/null); then
   case "$(printf '%s\n' "$E" | grep '^POLICY_ENFORCE_V2=' | tail -1)" in
     "" | POLICY_ENFORCE_V2=1 | POLICY_ENFORCE_V2=true) mode=policy ;;

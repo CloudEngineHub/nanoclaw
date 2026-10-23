@@ -655,7 +655,7 @@ esac
 
   it('on a converted gateway it reads only the version and the agent modes', () => {
     expect(dial({ version: '1.45.0' }, ['--delete']).status).toBe(0);
-    expect(calls()).toEqual([
+    expect(calls().filter((l) => !l.startsWith('docker '))).toEqual([
       `${GW} config get project`,
       `curl -fsS --max-time 10 ${GW}/api/health`,
       `${GW} agents list --max 0`,
@@ -826,8 +826,25 @@ esac
     },
   );
 
-  it('trusts a 127.0.0.1 binding when $GW names localhost', () => {
+  it('resolves a localhost $GW to the address its container binds, and asks only that address', () => {
     expect(dial({ rules: [], gw: 'http://localhost:10254' }).status).toBe(0);
+    const reads = calls().filter((l) => !l.startsWith('docker '));
+    expect(reads.length).toBeGreaterThan(2);
+    expect(
+      reads.every((l) => l.startsWith('http://127.0.0.1:10254 ') || l.endsWith(' http://127.0.0.1:10254/api/health')),
+    ).toBe(true);
+    fs.rmSync(path.join(home, 'calls.log'), { force: true });
+    const v6 = dial({
+      rules: [],
+      gw: 'http://localhost:10254',
+      ports: { '10254/tcp': [{ HostIp: '::1', HostPort: '10254' }] },
+    });
+    expect(v6.status).toBe(0);
+    expect(
+      calls()
+        .filter((l) => !l.startsWith('docker '))
+        .every((l) => l.includes('http://[::1]:10254')),
+    ).toBe(true);
   });
 
   it('trusts a container that publishes the port on every address', () => {
